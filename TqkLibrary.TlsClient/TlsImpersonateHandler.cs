@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -50,6 +51,13 @@ namespace TqkLibrary.TlsClient
         /// <summary>Reuse pooled HTTP/2 connections for sequential, body-less requests to the same host.</summary>
         public bool EnableConnectionReuse { get; set; } = true;
 
+        /// <summary>
+        /// Transparently decompress responses whose Content-Encoding is gzip/deflate/br (when the caller
+        /// advertised it via Accept-Encoding). Note: Accept-Encoding is never added automatically, so it
+        /// stays under the caller's control for fingerprint fidelity.
+        /// </summary>
+        public DecompressionMethods AutomaticDecompression { get; set; } = DecompressionMethods.All;
+
         /// <summary>Number of physical TLS connections this handler has opened (for diagnostics/tests).</summary>
         public int ConnectionsCreated => _connectionsCreated;
 
@@ -57,6 +65,40 @@ namespace TqkLibrary.TlsClient
         public Func<DnsEndPoint, CancellationToken, Task<Stream>> TransportFactory { get; set; } = DefaultTransportAsync;
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            HttpResponseMessage response = await SendCoreAsync(request, cancellationToken).ConfigureAwait(false);
+            ApplyDecompression(response);
+            return response;
+        }
+
+        private void ApplyDecompression(HttpResponseMessage response)
+        {
+            if (AutomaticDecompression == DecompressionMethods.None) return;
+            var contentEncoding = response.Content.Headers.ContentEncoding;
+            if (contentEncoding.Count == 0) return;
+
+            string encoding = contentEncoding.Last().ToLowerInvariant();
+            Stream source = response.Content.ReadAsStream();
+            Stream? decompressed = encoding switch
+            {
+                "gzip" when (AutomaticDecompression & DecompressionMethods.GZip) != 0 => new GZipStream(source, CompressionMode.Decompress),
+                "br" when (AutomaticDecompression & DecompressionMethods.Brotli) != 0 => new BrotliStream(source, CompressionMode.Decompress),
+                "deflate" when (AutomaticDecompression & DecompressionMethods.Deflate) != 0 => new ZLibStream(source, CompressionMode.Decompress),
+                _ => null,
+            };
+            if (decompressed is null) return;
+
+            var newContent = new StreamContent(decompressed);
+            foreach (var header in response.Content.Headers)
+            {
+                if (string.Equals(header.Key, "Content-Encoding", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.Equals(header.Key, "Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
+                newContent.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+            response.Content = newContent;
+        }
+
+        private async Task<HttpResponseMessage> SendCoreAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Uri uri = request.RequestUri ?? throw new InvalidOperationException("RequestUri is null.");
             if (!uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
