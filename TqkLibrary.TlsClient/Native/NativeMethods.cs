@@ -38,6 +38,13 @@ namespace TqkLibrary.TlsClient.Native
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern byte* TlsGetAlpn(long id);
 
+        /// <summary>
+        /// Server certificate chain as base64 of a length-prefixed DER sequence
+        /// (per cert: 4-byte big-endian length + DER). Free with <see cref="TlsFreeString"/>.
+        /// </summary>
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern byte* TlsGetPeerCertificates(long id);
+
         /// <summary>Close and release the connection handle.</summary>
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern void TlsClose(long id);

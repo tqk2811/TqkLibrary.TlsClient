@@ -1,28 +1,29 @@
-using System.Text;
 using TqkLibrary.TlsClient;
 using TqkLibrary.TlsClient.Profiles;
 
-using HttpClient http = TlsProfile.Chrome().CreateHttpClient(insecureSkipVerify: true);
-http.Timeout = TimeSpan.FromSeconds(60);
-http.DefaultRequestHeaders.TryAddWithoutValidation(
-    "user-agent",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-
-// recv flow control: download a body larger than the 6.29 MB stream window.
-using (var res = await http.GetAsync("https://cdn.jsdelivr.net/npm/typescript@5.4.5/lib/typescript.js"))
+// Certificate validation: default verify accepts valid certs and rejects bad ones; a callback can override.
+async Task Try(string label, string url, bool insecure = false, Action<TlsImpersonateHandler>? configure = null)
 {
-    byte[] d = await res.Content.ReadAsByteArrayAsync();
-    Console.WriteLine($"GET  HTTP/{res.Version} {(int)res.StatusCode}  recv={d.Length}");
+    var handler = new TlsImpersonateHandler(TlsProfile.Chrome()) { InsecureSkipVerify = insecure };
+    configure?.Invoke(handler);
+    using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+    http.DefaultRequestHeaders.TryAddWithoutValidation(
+        "user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+    try
+    {
+        using var res = await http.GetAsync(url);
+        Console.WriteLine($"{label,-34}: ACCEPTED  HTTP {(int)res.StatusCode}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"{label,-34}: REJECTED  {(ex.InnerException ?? ex).Message}");
+    }
 }
 
-// send flow control: POST a body larger than the default 65535 send window (forces WINDOW_UPDATE waits).
-const int n = 150_000;
-byte[] payload = Encoding.ASCII.GetBytes(new string('a', n));
-using (var req = new HttpRequestMessage(HttpMethod.Post, "https://nghttp2.org/httpbin/post") { Content = new ByteArrayContent(payload) })
-using (var res = await http.SendAsync(req))
-{
-    string echoed = await res.Content.ReadAsStringAsync();
-    bool ok = (int)res.StatusCode == 200 && echoed.Contains(n.ToString()); // httpbin echoes Content-Length
-    Console.WriteLine($"POST HTTP/{res.Version} {(int)res.StatusCode}  sent={payload.Length} respLen={echoed.Length}");
-    Console.WriteLine(ok ? "OK: large body sent under flow control (server received full length)" : "MISMATCH");
-}
+await Try("valid (default verify)", "https://cdn.jsdelivr.net/npm/typescript@5.4.5/package.json");
+await Try("self-signed (default verify)", "https://self-signed.badssl.com/");
+await Try("self-signed (callback accepts)", "https://self-signed.badssl.com/",
+    configure: h => h.ServerCertificateValidationCallback = (_, _, _, _) => true);
+await Try("wrong-host (default verify)", "https://wrong.host.badssl.com/");
+await Try("self-signed (InsecureSkipVerify)", "https://self-signed.badssl.com/", insecure: true);

@@ -10,6 +10,9 @@ package main
 import "C"
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net"
@@ -173,6 +176,25 @@ func TlsGetAlpn(id C.longlong) *C.char {
 		return C.CString("")
 	}
 	return C.CString(e.uconn.ConnectionState().NegotiatedProtocol)
+}
+
+// TlsGetPeerCertificates returns the server certificate chain as base64 of a length-prefixed
+// sequence (for each cert: 4-byte big-endian length + DER). Caller frees via TlsFreeString.
+//
+//export TlsGetPeerCertificates
+func TlsGetPeerCertificates(id C.longlong) *C.char {
+	e := lookup(int64(id))
+	if e == nil || e.uconn == nil {
+		return C.CString("")
+	}
+	var buf bytes.Buffer
+	for _, cert := range e.uconn.ConnectionState().PeerCertificates {
+		var lenBytes [4]byte
+		binary.BigEndian.PutUint32(lenBytes[:], uint32(len(cert.Raw)))
+		buf.Write(lenBytes[:])
+		buf.Write(cert.Raw)
+	}
+	return C.CString(base64.StdEncoding.EncodeToString(buf.Bytes()))
 }
 
 //export TlsClose

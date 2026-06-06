@@ -1,11 +1,16 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Net.Security;
 using System.Runtime.InteropServices;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using TqkLibrary.TlsClient.Native.Helpers;
 using TqkLibrary.TlsClient.Native.Models;
 
 namespace TqkLibrary.TlsClient.Native
@@ -43,6 +48,16 @@ namespace TqkLibrary.TlsClient.Native
         public string NegotiatedAlpn => _alpn;
 
         public bool IsAuthenticated => _authenticated;
+
+        /// <summary>The server certificate chain (leaf first), available after authentication.</summary>
+        public X509Certificate2[]? PeerCertificates { get; private set; }
+
+        /// <summary>
+        /// Optional certificate validation callback (same shape as <see cref="SslStream"/>'s). When set, it
+        /// decides whether to accept the server certificate (the chain is built with AIA + the OS trust store).
+        /// When null, default validation runs unless <see cref="TlsCodecOptions.InsecureSkipVerify"/> is set.
+        /// </summary>
+        public RemoteCertificateValidationCallback? CertificateValidationCallback { get; set; }
 
         /// <summary>Run the impersonated TLS handshake. Blocks on transport I/O, so it runs on a thread-pool thread.</summary>
         public Task AuthenticateAsClientAsync(TlsCodecOptions options, CancellationToken cancellationToken = default)
@@ -85,7 +100,65 @@ namespace TqkLibrary.TlsClient.Native
                 _alpn = Marshal.PtrToStringUTF8((IntPtr)alpn) ?? string.Empty;
                 NativeMethods.TlsFreeString(alpn);
             }
+
+            PeerCertificates = FetchPeerCertificates();
+            if (!options.InsecureSkipVerify)
+                ValidateServerCertificate(options.ServerName ?? string.Empty);
+
             _authenticated = true;
+        }
+
+        private X509Certificate2[] FetchPeerCertificates()
+        {
+            byte* p = NativeMethods.TlsGetPeerCertificates(_id);
+            if (p == null) return Array.Empty<X509Certificate2>();
+            string base64;
+            try { base64 = Marshal.PtrToStringUTF8((IntPtr)p) ?? string.Empty; }
+            finally { NativeMethods.TlsFreeString(p); }
+            if (base64.Length == 0) return Array.Empty<X509Certificate2>();
+
+            byte[] blob = Convert.FromBase64String(base64);
+            var certs = new List<X509Certificate2>();
+            int o = 0;
+            while (o + 4 <= blob.Length)
+            {
+                int len = (blob[o] << 24) | (blob[o + 1] << 16) | (blob[o + 2] << 8) | blob[o + 3];
+                o += 4;
+                if (len < 0 || o + len > blob.Length) break;
+                certs.Add(new X509Certificate2(blob.AsSpan(o, len).ToArray()));
+                o += len;
+            }
+            return certs.ToArray();
+        }
+
+        private void ValidateServerCertificate(string host)
+        {
+            if (PeerCertificates is null || PeerCertificates.Length == 0)
+                throw new AuthenticationException("The server presented no certificate.");
+
+            X509Certificate2 leaf = PeerCertificates[0];
+            using var chain = new X509Chain();
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            for (int i = 1; i < PeerCertificates.Length; i++)
+                chain.ChainPolicy.ExtraStore.Add(PeerCertificates[i]);
+
+            bool chainOk = chain.Build(leaf);   // builds against the OS trust store, chasing AIA intermediates
+            bool nameOk = HostnameVerifier.Matches(leaf, host);
+
+            SslPolicyErrors errors = SslPolicyErrors.None;
+            if (!chainOk) errors |= SslPolicyErrors.RemoteCertificateChainErrors;
+            if (!nameOk) errors |= SslPolicyErrors.RemoteCertificateNameMismatch;
+
+            RemoteCertificateValidationCallback? callback = CertificateValidationCallback;
+            if (callback != null)
+            {
+                if (!callback(this, leaf, chain, errors))
+                    throw new AuthenticationException("The certificate validation callback rejected the server certificate.");
+            }
+            else if (errors != SslPolicyErrors.None)
+            {
+                throw new AuthenticationException($"Server certificate validation failed: {errors}.");
+            }
         }
 
         private void EnsureAuth()
@@ -169,6 +242,11 @@ namespace TqkLibrary.TlsClient.Native
             }
             _bridge?.Dispose();
             _bridge = null;
+            if (PeerCertificates != null)
+            {
+                foreach (X509Certificate2 c in PeerCertificates) c.Dispose();
+                PeerCertificates = null;
+            }
             base.Dispose(disposing);
         }
     }

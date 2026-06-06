@@ -38,8 +38,11 @@ func DialTLS(transport net.Conn, opts *Options) (*utls.UConn, error) {
 	}
 
 	config := &utls.Config{
-		ServerName:         opts.ServerName,
-		InsecureSkipVerify: opts.InsecureSkipVerify,
+		ServerName: opts.ServerName,
+		// The handshake never rejects on the Go side; the C# caller performs certificate validation
+		// (its X509Chain can chase missing AIA intermediates, unlike Go's verifier). The peer
+		// certificates are exposed via TlsGetPeerCertificates.
+		InsecureSkipVerify: true,
 	}
 	uconn := utls.UClient(transport, config, utls.HelloCustom)
 	if err := uconn.ApplyPreset(spec); err != nil {

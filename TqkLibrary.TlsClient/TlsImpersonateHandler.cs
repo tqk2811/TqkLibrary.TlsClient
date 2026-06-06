@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -31,8 +32,15 @@ namespace TqkLibrary.TlsClient
         /// <summary>The browser impersonation profile (TLS + HTTP/2 fingerprint).</summary>
         public TlsProfile Profile { get; set; }
 
-        /// <summary>Skip server certificate validation. Note: the native verifier does not do AIA chasing.</summary>
+        /// <summary>Skip server certificate validation entirely.</summary>
         public bool InsecureSkipVerify { get; set; }
+
+        /// <summary>
+        /// Optional server certificate validation callback (same shape as <see cref="SslStream"/>'s). When null,
+        /// default validation runs (chain built with AIA + the OS trust store, plus a hostname check) unless
+        /// <see cref="InsecureSkipVerify"/> is set.
+        /// </summary>
+        public RemoteCertificateValidationCallback? ServerCertificateValidationCallback { get; set; }
 
         /// <summary>Produces a raw (unencrypted) connected transport stream for the target endpoint.</summary>
         public Func<DnsEndPoint, CancellationToken, Task<Stream>> TransportFactory { get; set; } = DefaultTransportAsync;
@@ -51,7 +59,10 @@ namespace TqkLibrary.TlsClient
             ImpersonatedTlsStream tls;
             try
             {
-                tls = new ImpersonatedTlsStream(transport, ownsInner: true);
+                tls = new ImpersonatedTlsStream(transport, ownsInner: true)
+                {
+                    CertificateValidationCallback = ServerCertificateValidationCallback,
+                };
                 await tls.AuthenticateAsClientAsync(new TlsCodecOptions
                 {
                     ServerName = host,
