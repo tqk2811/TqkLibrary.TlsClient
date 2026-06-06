@@ -1,11 +1,13 @@
 using System.Net.Sockets;
 using System.Text;
+using TqkLibrary.TlsClient.Http2;
+using TqkLibrary.TlsClient.Http2.Models;
 using TqkLibrary.TlsClient.Native;
 using TqkLibrary.TlsClient.Native.Models;
 
-// Phase 1 milestone: raw TcpClient stream -> ImpersonatedTlsStream (Stream in -> Stream out)
-// -> raw HTTP/1.1 -> read JSON -> the JA3 the server saw should be Chrome's.
-const string host = "tls.browserleaks.com";
+// Phase 3a demo: HTTP/2 over the impersonated stream against a lenient h2 server.
+const string host = "http2.golang.org";
+const string path = "/reqinfo";
 
 using var tcp = new TcpClient();
 await tcp.ConnectAsync(host, 443);
@@ -15,24 +17,16 @@ await tls.AuthenticateAsClientAsync(new TlsCodecOptions
 {
     ServerName = host,
     Profile = "chrome",
-    Alpn = new[] { "http/1.1" },
+    Alpn = new[] { "h2", "http/1.1" },
     InsecureSkipVerify = true,
 });
 Console.WriteLine($"ALPN negotiated: {tls.NegotiatedAlpn}");
 
-string req =
-    "GET /json HTTP/1.1\r\n" +
-    $"Host: {host}\r\n" +
-    "User-Agent: tqktls-phase1\r\n" +
-    "Accept: */*\r\n" +
-    "Connection: close\r\n\r\n";
-await tls.WriteAsync(Encoding.ASCII.GetBytes(req));
-await tls.FlushAsync();
+var conn = new Http2Connection(tls, Http2FingerprintConfig.Chrome());
+using var req = new HttpRequestMessage(HttpMethod.Get, $"https://{host}{path}");
+req.Headers.TryAddWithoutValidation("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+req.Headers.TryAddWithoutValidation("accept", "*/*");
 
-using var ms = new MemoryStream();
-byte[] buf = new byte[8192];
-int n;
-while ((n = await tls.ReadAsync(buf)) > 0)
-    ms.Write(buf, 0, n);
-
-Console.WriteLine(Encoding.UTF8.GetString(ms.ToArray()));
+byte[] body = await conn.SendAsync(req, default);
+Console.WriteLine($"body {body.Length} bytes:");
+Console.WriteLine(Encoding.UTF8.GetString(body));
