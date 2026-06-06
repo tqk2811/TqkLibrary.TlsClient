@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- TqkLibrary.Proxy pulls Microsoft.Extensions.* 10.x (built for net8+); it works on net6.0. -->
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TqkLibrary.TlsClient\TqkLibrary.TlsClient.csproj" />
+    <PackageReference Include="TqkLibrary.Proxy" Version="1.0.35" />
+  </ItemGroup>
+
+</Project>

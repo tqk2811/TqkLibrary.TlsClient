@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TqkLibrary.TlsClient\TqkLibrary.TlsClient.csproj" />
+    <ProjectReference Include="..\TqkLibrary.TlsClient.Proxy\TqkLibrary.TlsClient.Proxy.csproj" />
   </ItemGroup>
 
 </Project>
