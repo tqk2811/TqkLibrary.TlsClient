@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using TqkLibrary.TlsClient.Http2.Enums;
 
 namespace TqkLibrary.TlsClient.Http2.Models
@@ -11,6 +12,7 @@ namespace TqkLibrary.TlsClient.Http2.Models
             Value = value;
         }
 
+        [JsonConstructor]
         public Http2Setting(ushort id, uint value)
         {
             Id = id;

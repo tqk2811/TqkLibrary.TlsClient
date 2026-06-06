@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
 using TqkLibrary.TlsClient.Http2.Enums;
 
 namespace TqkLibrary.TlsClient.Http2.Models
@@ -23,6 +24,7 @@ namespace TqkLibrary.TlsClient.Http2.Models
         public IReadOnlyList<string> PseudoHeaderOrder { get; set; } = new[] { ":method", ":authority", ":scheme", ":path" };
 
         /// <summary>The INITIAL_WINDOW_SIZE we advertise (from <see cref="Settings"/>), used for receive flow control.</summary>
+        [JsonIgnore]
         public uint InitialWindowSize
         {
             get

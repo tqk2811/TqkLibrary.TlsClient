@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -9,37 +8,28 @@ using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.TlsClient.Http1;
 using TqkLibrary.TlsClient.Http2;
-using TqkLibrary.TlsClient.Http2.Models;
 using TqkLibrary.TlsClient.Native;
 using TqkLibrary.TlsClient.Native.Models;
+using TqkLibrary.TlsClient.Profiles;
 
 namespace TqkLibrary.TlsClient
 {
     /// <summary>
-    /// Terminal <see cref="HttpMessageHandler"/> that performs requests over an impersonated TLS
-    /// connection. The fingerprint (Chrome, captured ClientHello, ...) is configured here; the raw
-    /// transport is produced by <see cref="TransportFactory"/> (default: a plain TCP socket), so the
-    /// caller can plug in a proxy by returning its own <see cref="Stream"/>.
+    /// Terminal <see cref="HttpMessageHandler"/> that performs requests over an impersonated TLS + HTTP
+    /// connection. The browser fingerprint is described by a <see cref="TlsProfile"/>; the raw transport is
+    /// produced by <see cref="TransportFactory"/> (default: a plain TCP socket), so a proxy can be plugged in
+    /// by returning its own <see cref="Stream"/>. Dispatches to HTTP/2 or HTTP/1.1 based on negotiated ALPN.
     ///
     /// Place DelegatingHandlers (redirect/cookie) ABOVE this handler in the pipeline.
-    /// HTTP/2 is not implemented yet (Phase 3); keep <see cref="AlpnProtocols"/> at http/1.1 for now.
     /// </summary>
     public sealed class TlsImpersonateHandler : HttpMessageHandler
     {
-        /// <summary>Named preset, e.g. "chrome", "chrome_120", "firefox". Ignored if <see cref="RawClientHelloBase64"/> is set.</summary>
-        public string? Profile { get; set; } = "chrome";
+        public TlsImpersonateHandler() : this(TlsProfile.Chrome()) { }
 
-        /// <summary>JA3 string (native side not implemented yet).</summary>
-        public string? Ja3 { get; set; }
+        public TlsImpersonateHandler(TlsProfile profile) => Profile = profile ?? throw new ArgumentNullException(nameof(profile));
 
-        /// <summary>Captured ClientHello (full TLS record), base64. Highest-priority fingerprint source.</summary>
-        public string? RawClientHelloBase64 { get; set; }
-
-        /// <summary>ALPN protocols to offer (default Chrome-like h2 then http/1.1).</summary>
-        public IReadOnlyList<string> AlpnProtocols { get; set; } = new[] { "h2", "http/1.1" };
-
-        /// <summary>HTTP/2 fingerprint used when h2 is negotiated (SETTINGS/WINDOW_UPDATE/priorities/pseudo-order).</summary>
-        public Http2FingerprintConfig Http2Fingerprint { get; set; } = Http2FingerprintConfig.Chrome();
+        /// <summary>The browser impersonation profile (TLS + HTTP/2 fingerprint).</summary>
+        public TlsProfile Profile { get; set; }
 
         /// <summary>Skip server certificate validation. Note: the native verifier does not do AIA chasing.</summary>
         public bool InsecureSkipVerify { get; set; }
@@ -65,10 +55,10 @@ namespace TqkLibrary.TlsClient
                 await tls.AuthenticateAsClientAsync(new TlsCodecOptions
                 {
                     ServerName = host,
-                    Profile = Profile,
-                    Ja3 = Ja3,
-                    RawClientHelloBase64 = RawClientHelloBase64,
-                    Alpn = AlpnProtocols.ToArray(),
+                    Profile = Profile.Name,
+                    Ja3 = Profile.Ja3,
+                    RawClientHelloBase64 = Profile.RawClientHelloBase64,
+                    Alpn = Profile.Alpn.ToArray(),
                     InsecureSkipVerify = InsecureSkipVerify,
                 }, cancellationToken).ConfigureAwait(false);
             }
@@ -82,7 +72,7 @@ namespace TqkLibrary.TlsClient
             {
                 if (string.Equals(tls.NegotiatedAlpn, "h2", StringComparison.Ordinal))
                 {
-                    var http2 = new Http2Connection(tls, Http2Fingerprint);
+                    var http2 = new Http2Connection(tls, Profile.Http2);
                     HttpResponseMessage response = await http2.SendAsync(request, cancellationToken).ConfigureAwait(false);
                     tls.Dispose(); // the h2 body is fully buffered into the response, so the connection can close
                     return response;

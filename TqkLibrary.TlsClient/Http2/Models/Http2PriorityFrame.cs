@@ -1,8 +1,11 @@
+using System.Text.Json.Serialization;
+
 namespace TqkLibrary.TlsClient.Http2.Models
 {
     /// <summary>A PRIORITY frame to emit during connection setup (part of the Akamai h2 fingerprint).</summary>
     public sealed class Http2PriorityFrame
     {
+        [JsonConstructor]
         public Http2PriorityFrame(int streamId, bool exclusive, int streamDependency, byte weight)
         {
             StreamId = streamId;
