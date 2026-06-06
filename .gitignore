@@ -361,3 +361,9 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# --- TqkLibrary.TlsClient: native uTLS codec build outputs (rebuild via native/build.ps1) ---
+/native/tqktls.dll
+/native/tqktls.h
+/native/tqktls.lib
+/native/tqktls.exp
+**/runtimes/**/native/tqktls.*
