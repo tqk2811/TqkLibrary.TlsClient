@@ -13,24 +13,27 @@ using TqkLibrary.TlsClient.Http2.Models;
 namespace TqkLibrary.TlsClient.Http2
 {
     /// <summary>
-    /// A single-request HTTP/2 client over a plaintext stream (e.g. an authenticated ImpersonatedTlsStream).
-    /// It emits the connection preface, SETTINGS, connection WINDOW_UPDATE, PRIORITY frames and the request
-    /// HEADERS exactly as described by an <see cref="Http2FingerprintConfig"/> (so the Akamai h2 fingerprint
-    /// matches the configured browser), honors flow control both ways, and streams the response body.
+    /// An HTTP/2 client over a plaintext stream (e.g. an authenticated ImpersonatedTlsStream). It emits the
+    /// connection preface, SETTINGS, connection WINDOW_UPDATE and PRIORITY frames exactly as an
+    /// <see cref="Http2FingerprintConfig"/> describes (so the Akamai h2 fingerprint matches the configured
+    /// browser), honors flow control both ways, and streams the response body.
     ///
-    /// One request per connection (no multiplexing/pooling yet). The response body is streamed lazily; the
-    /// returned content owns the connection and disposes it when read to completion or disposed.
+    /// The connection can be reused for SEQUENTIAL requests (one in flight at a time): the preface is sent
+    /// once and each request opens the next odd stream id. Concurrent multiplexing is not implemented.
     /// </summary>
     public sealed class Http2Connection
     {
         private static readonly byte[] Preface = Encoding.ASCII.GetBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
         private const int DefaultMaxFrameSize = 16384;
-        private const int StreamId = 1;
 
         private readonly Stream _stream;
         private readonly Http2FingerprintConfig _config;
         private readonly HpackDecoder _hpack;
         private readonly byte[] _frameHeader = new byte[9];
+
+        private bool _started;
+        private int _nextStreamId = 1;
+        private int _activeStreamId;
 
         // Send-side flow control (how much the server lets us send).
         private long _connSendWindow = 65535;
@@ -55,6 +58,15 @@ namespace TqkLibrary.TlsClient.Http2
         /// <summary>Optional diagnostic sink for sent/received frames (debugging).</summary>
         public Action<string>? Trace { get; set; }
 
+        /// <summary>
+        /// Invoked when the response body is disposed, with whether the connection is reusable (the body was
+        /// fully drained). When null, the connection's underlying stream is disposed instead.
+        /// </summary>
+        internal Action<bool>? OnResponseDisposed { get; set; }
+
+        /// <summary>True while a request/response is in flight (not available for the next sequential request).</summary>
+        internal bool IsBusy { get; private set; }
+
         private readonly struct Frame
         {
             public Frame(int length, byte type, byte flags, int streamId, byte[] payload)
@@ -70,6 +82,11 @@ namespace TqkLibrary.TlsClient.Http2
 
         public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            IsBusy = true;
+            _activeStreamId = _nextStreamId;
+            _nextStreamId += 2;
+            _streamSendWindow = _serverInitialWindow; // each new stream starts at the server's initial window
+
             byte[]? body = request.Content != null
                 ? await request.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false)
                 : null;
@@ -77,17 +94,21 @@ namespace TqkLibrary.TlsClient.Http2
 
             using (var outBuf = new MemoryStream())
             {
-                outBuf.Write(Preface, 0, Preface.Length);
-                WriteSettingsFrame(outBuf);
-                if (_config.ConnectionWindowUpdateIncrement > 0)
-                    WriteFrame(outBuf, Http2FrameType.WindowUpdate, 0, 0, BeUInt32(_config.ConnectionWindowUpdateIncrement));
-                foreach (var p in _config.Priorities)
-                    WritePriorityFrame(outBuf, p);
+                if (!_started)
+                {
+                    outBuf.Write(Preface, 0, Preface.Length);
+                    WriteSettingsFrame(outBuf);
+                    if (_config.ConnectionWindowUpdateIncrement > 0)
+                        WriteFrame(outBuf, Http2FrameType.WindowUpdate, 0, 0, BeUInt32(_config.ConnectionWindowUpdateIncrement));
+                    foreach (var p in _config.Priorities)
+                        WritePriorityFrame(outBuf, p);
+                    _started = true;
+                }
 
                 byte[] headerBlock = BuildHeaderBlock(request);
                 WriteFrame(outBuf, Http2FrameType.Headers,
                     (byte)(Http2FrameFlags.EndHeaders | (hasBody ? 0 : Http2FrameFlags.EndStream)),
-                    StreamId, headerBlock);
+                    _activeStreamId, headerBlock);
 
                 byte[] toSend = outBuf.ToArray();
                 Trace?.Invoke("send " + Convert.ToHexString(toSend));
@@ -117,15 +138,13 @@ namespace TqkLibrary.TlsClient.Http2
                 int chunk = Math.Min(allowed, body.Length - offset);
                 bool last = offset + chunk >= body.Length;
                 await WriteRawFrameAsync(Http2FrameType.Data,
-                    (byte)(last ? Http2FrameFlags.EndStream : Http2FrameFlags.None), StreamId, body, offset, chunk, ct).ConfigureAwait(false);
+                    (byte)(last ? Http2FrameFlags.EndStream : Http2FrameFlags.None), _activeStreamId, body, offset, chunk, ct).ConfigureAwait(false);
                 offset += chunk;
                 _streamSendWindow -= chunk;
                 _connSendWindow -= chunk;
             }
         }
 
-        // Reads frames until the response header block is complete, then returns a response whose body
-        // streams the remaining DATA frames lazily.
         private async Task<HttpResponseMessage> ReadResponseAsync(HttpRequestMessage request, CancellationToken ct)
         {
             using var headerBlock = new MemoryStream();
@@ -139,7 +158,7 @@ namespace TqkLibrary.TlsClient.Http2
                 var frameType = (Http2FrameType)f.Type;
                 if (Trace != null) Trace($"recv type={frameType} flags=0x{f.Flags:x2} sid={f.StreamId} len={f.Length}");
 
-                if (expectingContinuation && !(frameType == Http2FrameType.Continuation && f.StreamId == StreamId))
+                if (expectingContinuation && !(frameType == Http2FrameType.Continuation && f.StreamId == _activeStreamId))
                     throw new IOException("Expected CONTINUATION frame.");
 
                 if (await TryHandleControlFrameAsync(f, ct).ConfigureAwait(false))
@@ -151,11 +170,11 @@ namespace TqkLibrary.TlsClient.Http2
                         throw new IOException("Server sent GOAWAY before responding.");
 
                     case Http2FrameType.RstStream:
-                        if (f.StreamId == StreamId) throw new IOException("Server reset the stream before responding.");
+                        if (f.StreamId == _activeStreamId) throw new IOException("Server reset the stream before responding.");
                         break;
 
                     case Http2FrameType.Headers:
-                        if (f.StreamId == StreamId)
+                        if (f.StreamId == _activeStreamId)
                         {
                             byte[] fragment = ExtractHeaderBlockFragment(f.Payload, f.Flags);
                             headerBlock.Write(fragment, 0, fragment.Length);
@@ -167,7 +186,7 @@ namespace TqkLibrary.TlsClient.Http2
                         break;
 
                     case Http2FrameType.Continuation:
-                        if (f.StreamId == StreamId)
+                        if (f.StreamId == _activeStreamId)
                         {
                             headerBlock.Write(f.Payload, 0, f.Payload.Length);
                             bool endHeaders = (f.Flags & (byte)Http2FrameFlags.EndHeaders) != 0;
@@ -178,10 +197,9 @@ namespace TqkLibrary.TlsClient.Http2
                 }
             }
 
-            return BuildResponse(responseHeaders, new Http2ResponseStream(this, endStream), request);
+            return BuildResponse(responseHeaders, new Http2ResponseStream(this, _activeStreamId, endStream), request);
         }
 
-        // Handles SETTINGS / PING / WINDOW_UPDATE (which both the send and receive paths must process).
         private async Task<bool> TryHandleControlFrameAsync(Frame f, CancellationToken ct)
         {
             switch ((Http2FrameType)f.Type)
@@ -204,7 +222,7 @@ namespace TqkLibrary.TlsClient.Http2
                     {
                         long inc = BeUInt32At(f.Payload, 0) & 0x7fffffff;
                         if (f.StreamId == 0) _connSendWindow += inc;
-                        else if (f.StreamId == StreamId) _streamSendWindow += inc;
+                        else if (f.StreamId == _activeStreamId) _streamSendWindow += inc;
                     }
                     return true;
             }
@@ -244,7 +262,6 @@ namespace TqkLibrary.TlsClient.Http2
                 headers.Add(new KeyValuePair<string, string>(pseudo, value));
             }
 
-            // Use NonValidated so structured headers (User-Agent, ...) are emitted as the raw single value.
             foreach (var header in request.Headers.NonValidated)
             {
                 string name = header.Key.ToLowerInvariant();
@@ -281,7 +298,7 @@ namespace TqkLibrary.TlsClient.Http2
             response.Content = content;
             foreach (var h in headers)
             {
-                if (h.Key.Length > 0 && h.Key[0] == ':') continue; // pseudo-headers
+                if (h.Key.Length > 0 && h.Key[0] == ':') continue;
                 if (!response.Headers.TryAddWithoutValidation(h.Key, h.Value))
                     content.Headers.TryAddWithoutValidation(h.Key, h.Value);
             }
@@ -290,12 +307,12 @@ namespace TqkLibrary.TlsClient.Http2
 
         private void DisposeUnderlying() => _stream.Dispose();
 
-        private async Task ReplenishWindowsAsync(int dataLength, bool streamEnded, CancellationToken ct)
+        private async Task ReplenishWindowsAsync(int streamId, int dataLength, bool streamEnded, CancellationToken ct)
         {
             if (dataLength <= 0) return;
             await WriteRawFrameAsync(Http2FrameType.WindowUpdate, 0, 0, BeUInt32((uint)dataLength), ct).ConfigureAwait(false);
             if (!streamEnded)
-                await WriteRawFrameAsync(Http2FrameType.WindowUpdate, 0, StreamId, BeUInt32((uint)dataLength), ct).ConfigureAwait(false);
+                await WriteRawFrameAsync(Http2FrameType.WindowUpdate, 0, streamId, BeUInt32((uint)dataLength), ct).ConfigureAwait(false);
         }
 
         private static byte[] ExtractData(byte[] payload, byte flags)
@@ -436,17 +453,20 @@ namespace TqkLibrary.TlsClient.Http2
         private static uint BeUInt32At(byte[] b, int o)
             => ((uint)b[o] << 24) | ((uint)b[o + 1] << 16) | ((uint)b[o + 2] << 8) | b[o + 3];
 
-        /// <summary>Streams the response DATA frames lazily and owns the connection's lifetime.</summary>
+        /// <summary>Streams the response DATA frames lazily; on dispose, releases the connection (reusable if fully drained).</summary>
         private sealed class Http2ResponseStream : Stream
         {
             private readonly Http2Connection _conn;
+            private readonly int _streamId;
             private byte[] _leftover = Array.Empty<byte>();
             private int _leftoverPos;
             private bool _done;
+            private bool _disposed;
 
-            public Http2ResponseStream(Http2Connection conn, bool endStream)
+            public Http2ResponseStream(Http2Connection conn, int streamId, bool endStream)
             {
                 _conn = conn;
+                _streamId = streamId;
                 _done = endStream;
             }
 
@@ -467,9 +487,9 @@ namespace TqkLibrary.TlsClient.Http2
 
                     switch (type)
                     {
-                        case Http2FrameType.Data when f.StreamId == StreamId:
+                        case Http2FrameType.Data when f.StreamId == _streamId:
                             bool end = (f.Flags & (byte)Http2FrameFlags.EndStream) != 0;
-                            await _conn.ReplenishWindowsAsync(f.Length, end, ct).ConfigureAwait(false);
+                            await _conn.ReplenishWindowsAsync(_streamId, f.Length, end, ct).ConfigureAwait(false);
                             if (end) _done = true;
                             byte[] data = ExtractData(f.Payload, f.Flags);
                             if (data.Length == 0)
@@ -481,7 +501,7 @@ namespace TqkLibrary.TlsClient.Http2
                             _leftoverPos = 0;
                             return CopyLeftover(buffer.Span);
 
-                        case Http2FrameType.Headers when f.StreamId == StreamId: // trailers
+                        case Http2FrameType.Headers when f.StreamId == _streamId:
                             if ((f.Flags & (byte)Http2FrameFlags.EndStream) != 0) { _done = true; return 0; }
                             break;
 
@@ -489,7 +509,7 @@ namespace TqkLibrary.TlsClient.Http2
                             _done = true;
                             return 0;
 
-                        case Http2FrameType.RstStream when f.StreamId == StreamId:
+                        case Http2FrameType.RstStream when f.StreamId == _streamId:
                             _done = true;
                             return 0;
                     }
@@ -512,7 +532,14 @@ namespace TqkLibrary.TlsClient.Http2
 
             protected override void Dispose(bool disposing)
             {
-                if (disposing) _conn.DisposeUnderlying();
+                if (disposing && !_disposed)
+                {
+                    _disposed = true;
+                    _conn.IsBusy = false;
+                    bool reusable = _done && _leftoverPos >= _leftover.Length;
+                    if (_conn.OnResponseDisposed is { } release) release(reusable);
+                    else _conn.DisposeUnderlying();
+                }
                 base.Dispose(disposing);
             }
 

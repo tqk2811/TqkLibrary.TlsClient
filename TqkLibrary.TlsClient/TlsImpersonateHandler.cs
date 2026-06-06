@@ -11,6 +11,7 @@ using TqkLibrary.TlsClient.Http1;
 using TqkLibrary.TlsClient.Http2;
 using TqkLibrary.TlsClient.Native;
 using TqkLibrary.TlsClient.Native.Models;
+using TqkLibrary.TlsClient.Pooling;
 using TqkLibrary.TlsClient.Profiles;
 
 namespace TqkLibrary.TlsClient
@@ -21,10 +22,14 @@ namespace TqkLibrary.TlsClient
     /// produced by <see cref="TransportFactory"/> (default: a plain TCP socket), so a proxy can be plugged in
     /// by returning its own <see cref="Stream"/>. Dispatches to HTTP/2 or HTTP/1.1 based on negotiated ALPN.
     ///
+    /// HTTP/2 connections are pooled and reused for sequential, body-less requests to the same host.
     /// Place DelegatingHandlers (redirect/cookie) ABOVE this handler in the pipeline.
     /// </summary>
     public sealed class TlsImpersonateHandler : HttpMessageHandler
     {
+        private readonly TlsConnectionPool _pool = new();
+        private int _connectionsCreated;
+
         public TlsImpersonateHandler() : this(TlsProfile.Chrome()) { }
 
         public TlsImpersonateHandler(TlsProfile profile) => Profile = profile ?? throw new ArgumentNullException(nameof(profile));
@@ -42,6 +47,12 @@ namespace TqkLibrary.TlsClient
         /// </summary>
         public RemoteCertificateValidationCallback? ServerCertificateValidationCallback { get; set; }
 
+        /// <summary>Reuse pooled HTTP/2 connections for sequential, body-less requests to the same host.</summary>
+        public bool EnableConnectionReuse { get; set; } = true;
+
+        /// <summary>Number of physical TLS connections this handler has opened (for diagnostics/tests).</summary>
+        public int ConnectionsCreated => _connectionsCreated;
+
         /// <summary>Produces a raw (unencrypted) connected transport stream for the target endpoint.</summary>
         public Func<DnsEndPoint, CancellationToken, Task<Stream>> TransportFactory { get; set; } = DefaultTransportAsync;
 
@@ -52,14 +63,71 @@ namespace TqkLibrary.TlsClient
                 throw new NotSupportedException($"Only https is supported, got '{uri.Scheme}'.");
 
             string host = uri.IdnHost;
-            var endPoint = new DnsEndPoint(host, uri.Port);
+            int port = uri.Port;
+            string key = host + ":" + port;
 
-            Stream transport = await TransportFactory(endPoint, cancellationToken).ConfigureAwait(false);
+            // Reuse a pooled h2 connection for sequential, body-less requests (safe to retry on a stale one).
+            if (EnableConnectionReuse && request.Content is null)
+            {
+                for (PooledConnection? rented = _pool.Rent(key); rented is not null; rented = _pool.Rent(key))
+                {
+                    if (rented.Http2 is null)
+                    {
+                        rented.Dispose();
+                        continue;
+                    }
+                    try
+                    {
+                        return await SendOverHttp2Async(rented, key, request, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (IOException)
+                    {
+                        rented.Dispose(); // stale connection — try another idle one, then a fresh connection
+                    }
+                    catch
+                    {
+                        rented.Dispose();
+                        throw;
+                    }
+                }
+            }
 
-            ImpersonatedTlsStream tls;
+            (ImpersonatedTlsStream tls, string alpn) = await ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
             try
             {
-                tls = new ImpersonatedTlsStream(transport, ownsInner: true)
+                if (string.Equals(alpn, "h2", StringComparison.Ordinal))
+                {
+                    var pooled = new PooledConnection(tls, alpn, new Http2Connection(tls, Profile.Http2));
+                    return await SendOverHttp2Async(pooled, key, request, cancellationToken).ConfigureAwait(false);
+                }
+
+                // HTTP/1.1: the response body streams from tls, so the content owns the connection's lifetime.
+                return await new Http1Connection(tls, owner: tls).SendAsync(request, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                tls.Dispose();
+                throw;
+            }
+        }
+
+        private async Task<HttpResponseMessage> SendOverHttp2Async(PooledConnection pooled, string key, HttpRequestMessage request, CancellationToken ct)
+        {
+            Http2Connection http2 = pooled.Http2!;
+            http2.OnResponseDisposed = reusable =>
+            {
+                if (reusable && EnableConnectionReuse) _pool.Return(key, pooled);
+                else pooled.Dispose();
+            };
+            return await http2.SendAsync(request, ct).ConfigureAwait(false);
+        }
+
+        private async Task<(ImpersonatedTlsStream Tls, string Alpn)> ConnectAsync(string host, int port, CancellationToken ct)
+        {
+            Stream transport = await TransportFactory(new DnsEndPoint(host, port), ct).ConfigureAwait(false);
+            try
+            {
+                var tls = new ImpersonatedTlsStream(transport, ownsInner: true)
                 {
                     CertificateValidationCallback = ServerCertificateValidationCallback,
                 };
@@ -71,29 +139,13 @@ namespace TqkLibrary.TlsClient
                     RawClientHelloBase64 = Profile.RawClientHelloBase64,
                     Alpn = Profile.Alpn.ToArray(),
                     InsecureSkipVerify = InsecureSkipVerify,
-                }, cancellationToken).ConfigureAwait(false);
+                }, ct).ConfigureAwait(false);
+                Interlocked.Increment(ref _connectionsCreated);
+                return (tls, tls.NegotiatedAlpn);
             }
             catch
             {
                 transport.Dispose();
-                throw;
-            }
-
-            try
-            {
-                if (string.Equals(tls.NegotiatedAlpn, "h2", StringComparison.Ordinal))
-                {
-                    // The response body streams from tls; disposing the response content disposes the connection.
-                    var http2 = new Http2Connection(tls, Profile.Http2);
-                    return await http2.SendAsync(request, cancellationToken).ConfigureAwait(false);
-                }
-
-                // HTTP/1.1: the response body streams from tls, so the content owns the connection's lifetime.
-                return await new Http1Connection(tls, owner: tls).SendAsync(request, cancellationToken).ConfigureAwait(false);
-            }
-            catch
-            {
-                tls.Dispose();
                 throw;
             }
         }
@@ -111,6 +163,12 @@ namespace TqkLibrary.TlsClient
                 throw;
             }
             return new NetworkStream(socket, ownsSocket: true);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _pool.Dispose();
+            base.Dispose(disposing);
         }
     }
 }
