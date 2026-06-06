@@ -24,9 +24,23 @@ func TestBuildSpec_NoSource(t *testing.T) {
 	}
 }
 
-func TestBuildSpec_Ja3NotImplemented(t *testing.T) {
-	if _, err := buildSpec(&Options{Ja3: "771,..."}); err == nil {
-		t.Fatal("ja3 mode should report not-implemented for now")
+func TestBuildSpec_Ja3(t *testing.T) {
+	ja3 := "771,4865-4866-4867-49195-49199,0-23-65281-10-11-35-16-5-13-51-43-45,29-23-24,0"
+	spec, err := buildSpec(&Options{Ja3: ja3})
+	if err != nil {
+		t.Fatalf("buildSpec(ja3): %v", err)
+	}
+	if len(spec.CipherSuites) != 5 {
+		t.Fatalf("expected 5 cipher suites, got %d", len(spec.CipherSuites))
+	}
+	if len(spec.Extensions) == 0 {
+		t.Fatal("expected extensions from ja3")
+	}
+}
+
+func TestJa3_InvalidFieldCount(t *testing.T) {
+	if _, err := buildSpec(&Options{Ja3: "771,4865"}); err == nil {
+		t.Fatal("expected an error for a malformed ja3 string")
 	}
 }
 

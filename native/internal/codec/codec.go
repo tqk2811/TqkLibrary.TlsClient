@@ -82,7 +82,7 @@ func buildSpec(opts *Options) (*utls.ClientHelloSpec, error) {
 		return &spec, nil
 
 	case opts.Ja3 != "":
-		return nil, fmt.Errorf("ja3 mode not implemented yet")
+		return ja3ToSpec(opts.Ja3)
 	}
 	return nil, fmt.Errorf("no fingerprint source: set rawClientHelloBase64, profile or ja3")
 }
