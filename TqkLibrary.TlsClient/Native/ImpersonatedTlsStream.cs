@@ -61,7 +61,15 @@ namespace TqkLibrary.TlsClient.Native
 
         /// <summary>Run the impersonated TLS handshake. Blocks on transport I/O, so it runs on a thread-pool thread.</summary>
         public Task AuthenticateAsClientAsync(TlsCodecOptions options, CancellationToken cancellationToken = default)
-            => Task.Run(() => AuthenticateAsClient(options), cancellationToken);
+            => CancellableOp.RunAsync(() => { AuthenticateAsClient(options); return 0; }, AbortTransport, cancellationToken);
+
+        // Native read/write/handshake block on transport I/O inside a thread-pool thread; they can't be
+        // interrupted directly. On cancellation we dispose the transport, which makes the blocked call fault
+        // and unwind. The request's connection is then dead (expected for a cancelled/timed-out request).
+        private void AbortTransport()
+        {
+            try { _inner.Dispose(); } catch { /* unblocks any in-flight native read/write */ }
+        }
 
         public void AuthenticateAsClient(TlsCodecOptions options)
         {
@@ -201,20 +209,16 @@ namespace TqkLibrary.TlsClient.Native
         }
 
         public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-            => Task.Run(() => Read(buffer, offset, count), cancellationToken);
+            => CancellableOp.RunAsync(() => Read(buffer, offset, count), AbortTransport, cancellationToken);
 
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-            => new(Task.Run(() => ReadMemory(buffer), cancellationToken));
-
-        private int ReadMemory(Memory<byte> buffer) => Read(buffer.Span);
+            => new(CancellableOp.RunAsync(() => Read(buffer.Span), AbortTransport, cancellationToken));
 
         public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-            => Task.Run(() => Write(buffer, offset, count), cancellationToken);
+            => CancellableOp.RunAsync(() => { Write(buffer, offset, count); return 0; }, AbortTransport, cancellationToken);
 
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
-            => new(Task.Run(() => WriteMemory(buffer), cancellationToken));
-
-        private void WriteMemory(ReadOnlyMemory<byte> buffer) => Write(buffer.Span);
+            => new(CancellableOp.RunAsync(() => { Write(buffer.Span); return 0; }, AbortTransport, cancellationToken));
 
         public override void Flush() => _inner.Flush();
 
