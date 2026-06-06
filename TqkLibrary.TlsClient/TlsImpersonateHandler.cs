@@ -83,10 +83,9 @@ namespace TqkLibrary.TlsClient
             {
                 if (string.Equals(tls.NegotiatedAlpn, "h2", StringComparison.Ordinal))
                 {
+                    // The response body streams from tls; disposing the response content disposes the connection.
                     var http2 = new Http2Connection(tls, Profile.Http2);
-                    HttpResponseMessage response = await http2.SendAsync(request, cancellationToken).ConfigureAwait(false);
-                    tls.Dispose(); // the h2 body is fully buffered into the response, so the connection can close
-                    return response;
+                    return await http2.SendAsync(request, cancellationToken).ConfigureAwait(false);
                 }
 
                 // HTTP/1.1: the response body streams from tls, so the content owns the connection's lifetime.
