@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
@@ -15,10 +16,9 @@ namespace TqkLibrary.TlsClient.Http2
     /// A single-request HTTP/2 client over a plaintext stream (e.g. an authenticated ImpersonatedTlsStream).
     /// It emits the connection preface, SETTINGS, connection WINDOW_UPDATE, PRIORITY frames and the request
     /// HEADERS exactly as described by an <see cref="Http2FingerprintConfig"/> (so the Akamai h2 fingerprint
-    /// matches the configured browser), then collects the response DATA frames.
+    /// matches the configured browser), then decodes the response (HPACK) into an <see cref="HttpResponseMessage"/>.
     ///
-    /// Phase 3a scope: returns the response body bytes; response headers/status are added in Phase 3b
-    /// (HPACK decode). One request per connection (no multiplexing/pooling yet).
+    /// One request per connection (no multiplexing/pooling yet); the response body is buffered.
     /// </summary>
     public sealed class Http2Connection
     {
@@ -27,19 +27,25 @@ namespace TqkLibrary.TlsClient.Http2
 
         private readonly Stream _stream;
         private readonly Http2FingerprintConfig _config;
+        private readonly HpackDecoder _hpack;
         private readonly byte[] _frameHeader = new byte[9];
 
         public Http2Connection(Stream stream, Http2FingerprintConfig config)
         {
             _stream = stream ?? throw new ArgumentNullException(nameof(stream));
             _config = config ?? throw new ArgumentNullException(nameof(config));
+
+            int headerTableSize = 65536;
+            foreach (var s in config.Settings)
+                if (s.Id == (ushort)Http2SettingId.HeaderTableSize)
+                    headerTableSize = (int)s.Value;
+            _hpack = new HpackDecoder(headerTableSize);
         }
 
-        /// <summary>Optional diagnostic sink for received frames (debugging).</summary>
+        /// <summary>Optional diagnostic sink for sent/received frames (debugging).</summary>
         public Action<string>? Trace { get; set; }
 
-        /// <summary>Sends the request and returns the raw response body. Status/headers come in Phase 3b.</summary>
-        public async Task<byte[]> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             const int streamId = 1;
 
@@ -69,7 +75,7 @@ namespace TqkLibrary.TlsClient.Http2
             await _stream.WriteAsync(toSend, 0, toSend.Length, cancellationToken).ConfigureAwait(false);
             await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
 
-            return await ReadResponseBodyAsync(streamId, cancellationToken).ConfigureAwait(false);
+            return await ReadResponseAsync(streamId, request, cancellationToken).ConfigureAwait(false);
         }
 
         private byte[] BuildHeaderBlock(HttpRequestMessage request)
@@ -118,26 +124,26 @@ namespace TqkLibrary.TlsClient.Http2
             _ => false,
         };
 
-        private async Task<byte[]> ReadResponseBodyAsync(int streamId, CancellationToken ct)
+        private async Task<HttpResponseMessage> ReadResponseAsync(int streamId, HttpRequestMessage request, CancellationToken ct)
         {
             using var body = new MemoryStream();
-            while (true)
+            using var headerBlock = new MemoryStream();
+            List<KeyValuePair<string, string>>? responseHeaders = null;
+            bool endStream = false;
+            bool expectingContinuation = false;
+
+            while (!endStream)
             {
                 (int length, byte type, byte flags, int sid) = await ReadFrameHeaderAsync(ct).ConfigureAwait(false);
                 byte[] payload = length > 0 ? await ReadExactlyAsync(length, ct).ConfigureAwait(false) : Array.Empty<byte>();
+                var frameType = (Http2FrameType)type;
 
-                if (Trace != null)
-                {
-                    string extra = (Http2FrameType)type switch
-                    {
-                        Http2FrameType.GoAway when payload.Length >= 8 => $" lastStream={(payload[4] << 24) | (payload[5] << 16) | (payload[6] << 8) | payload[7]} err={BeUInt32At(payload, 4)} debug={Encoding.ASCII.GetString(payload, 8, payload.Length - 8)}",
-                        Http2FrameType.RstStream when payload.Length >= 4 => $" err={BeUInt32At(payload, 0)}",
-                        _ => string.Empty,
-                    };
-                    Trace($"recv type={(Http2FrameType)type} flags=0x{flags:x2} sid={sid} len={length}{extra}");
-                }
+                if (Trace != null) Trace($"recv type={frameType} flags=0x{flags:x2} sid={sid} len={length}");
 
-                switch ((Http2FrameType)type)
+                if (expectingContinuation && !(frameType == Http2FrameType.Continuation && sid == streamId))
+                    throw new IOException("Expected CONTINUATION frame.");
+
+                switch (frameType)
                 {
                     case Http2FrameType.Settings:
                         if ((flags & (byte)Http2FrameFlags.Ack) == 0)
@@ -150,25 +156,97 @@ namespace TqkLibrary.TlsClient.Http2
                         break;
 
                     case Http2FrameType.GoAway:
-                        return body.ToArray();
+                        if (responseHeaders is null) throw new IOException("Server sent GOAWAY before responding.");
+                        endStream = true;
+                        break;
 
                     case Http2FrameType.RstStream:
-                        if (sid == streamId) return body.ToArray();
+                        if (sid == streamId)
+                        {
+                            if (responseHeaders is null) throw new IOException("Server reset the stream before responding.");
+                            endStream = true;
+                        }
                         break;
 
                     case Http2FrameType.Headers:
-                        if (sid == streamId && (flags & (byte)Http2FrameFlags.EndStream) != 0) return body.ToArray();
+                        if (sid == streamId)
+                        {
+                            if (responseHeaders is null)
+                            {
+                                byte[] fragment = ExtractHeaderBlockFragment(payload, flags);
+                                headerBlock.Write(fragment, 0, fragment.Length);
+                            }
+                            bool endHeaders = (flags & (byte)Http2FrameFlags.EndHeaders) != 0;
+                            expectingContinuation = !endHeaders;
+                            if (responseHeaders is null && endHeaders)
+                            {
+                                responseHeaders = _hpack.Decode(headerBlock.ToArray());
+                                headerBlock.SetLength(0);
+                            }
+                            if ((flags & (byte)Http2FrameFlags.EndStream) != 0) endStream = true;
+                        }
+                        break;
+
+                    case Http2FrameType.Continuation:
+                        if (sid == streamId)
+                        {
+                            if (responseHeaders is null) headerBlock.Write(payload, 0, payload.Length);
+                            bool endHeaders = (flags & (byte)Http2FrameFlags.EndHeaders) != 0;
+                            expectingContinuation = !endHeaders;
+                            if (responseHeaders is null && endHeaders)
+                            {
+                                responseHeaders = _hpack.Decode(headerBlock.ToArray());
+                                headerBlock.SetLength(0);
+                            }
+                        }
                         break;
 
                     case Http2FrameType.Data:
                         if (sid == streamId)
                         {
                             WriteData(body, payload, flags);
-                            if ((flags & (byte)Http2FrameFlags.EndStream) != 0) return body.ToArray();
+                            if ((flags & (byte)Http2FrameFlags.EndStream) != 0) endStream = true;
                         }
                         break;
                 }
             }
+
+            return BuildResponse(responseHeaders!, body.ToArray(), request);
+        }
+
+        private static HttpResponseMessage BuildResponse(List<KeyValuePair<string, string>> headers, byte[] body, HttpRequestMessage request)
+        {
+            var response = new HttpResponseMessage { Version = HttpVersion.Version20, RequestMessage = request };
+            foreach (var h in headers)
+                if (h.Key == ":status" && int.TryParse(h.Value, out int code))
+                    response.StatusCode = (HttpStatusCode)code;
+
+            response.Content = new ByteArrayContent(body);
+            foreach (var h in headers)
+            {
+                if (h.Key.Length > 0 && h.Key[0] == ':') continue;          // pseudo-headers
+                if (string.Equals(h.Key, "content-length", StringComparison.OrdinalIgnoreCase)) continue; // set by ByteArrayContent
+                if (!response.Headers.TryAddWithoutValidation(h.Key, h.Value))
+                    response.Content.Headers.TryAddWithoutValidation(h.Key, h.Value);
+            }
+            return response;
+        }
+
+        private static byte[] ExtractHeaderBlockFragment(byte[] payload, byte flags)
+        {
+            int start = 0;
+            int end = payload.Length;
+            if ((flags & (byte)Http2FrameFlags.Padded) != 0 && payload.Length > 0)
+            {
+                int padLength = payload[0];
+                start = 1;
+                end = payload.Length - padLength;
+            }
+            if ((flags & (byte)Http2FrameFlags.Priority) != 0)
+                start += 5; // exclusive(1) + stream dependency(31) + weight(8)
+
+            if (end < start) end = start;
+            return payload[start..end];
         }
 
         private static void WriteData(MemoryStream body, byte[] payload, byte flags)
@@ -297,8 +375,5 @@ namespace TqkLibrary.TlsClient.Http2
         {
             (byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value,
         };
-
-        private static uint BeUInt32At(byte[] b, int o)
-            => ((uint)b[o] << 24) | ((uint)b[o + 1] << 16) | ((uint)b[o + 2] << 8) | b[o + 3];
     }
 }

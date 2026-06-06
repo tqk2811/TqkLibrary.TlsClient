@@ -1,32 +1,20 @@
-using System.Net.Sockets;
-using System.Text;
-using TqkLibrary.TlsClient.Http2;
-using TqkLibrary.TlsClient.Http2.Models;
-using TqkLibrary.TlsClient.Native;
-using TqkLibrary.TlsClient.Native.Models;
+using TqkLibrary.TlsClient;
 
-// Phase 3a demo: HTTP/2 over the impersonated stream against a lenient h2 server.
-const string host = "http2.golang.org";
-const string path = "/reqinfo";
-
-using var tcp = new TcpClient();
-await tcp.ConnectAsync(host, 443);
-
-await using var tls = new ImpersonatedTlsStream(tcp.GetStream(), ownsInner: false);
-await tls.AuthenticateAsClientAsync(new TlsCodecOptions
+// Phase 3c demo: a normal HttpClient whose terminal handler impersonates Chrome's TLS AND HTTP/2.
+// The handler negotiates h2 via ALPN and speaks Chrome-fingerprinted HTTP/2 automatically.
+using var handler = new TlsImpersonateHandler
 {
-    ServerName = host,
     Profile = "chrome",
-    Alpn = new[] { "h2", "http/1.1" },
-    InsecureSkipVerify = true,
-});
-Console.WriteLine($"ALPN negotiated: {tls.NegotiatedAlpn}");
+    InsecureSkipVerify = true, // the native (Go) verifier does not do AIA intermediate chasing
+};
+using var http = new HttpClient(handler);
+http.DefaultRequestHeaders.TryAddWithoutValidation(
+    "user-agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
 
-var conn = new Http2Connection(tls, Http2FingerprintConfig.Chrome());
-using var req = new HttpRequestMessage(HttpMethod.Get, $"https://{host}{path}");
-req.Headers.TryAddWithoutValidation("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-req.Headers.TryAddWithoutValidation("accept", "*/*");
-
-byte[] body = await conn.SendAsync(req, default);
-Console.WriteLine($"body {body.Length} bytes:");
-Console.WriteLine(Encoding.UTF8.GetString(body));
+using var res = await http.GetAsync("https://www.google.com/");
+Console.WriteLine($"HTTP/{res.Version} {(int)res.StatusCode} {res.ReasonPhrase}");
+Console.WriteLine($"Content-Type: {res.Content.Headers.ContentType}");
+string body = await res.Content.ReadAsStringAsync();
+Console.WriteLine($"body: {body.Length} chars");
+Console.WriteLine(body.Substring(0, Math.Min(120, body.Length)));

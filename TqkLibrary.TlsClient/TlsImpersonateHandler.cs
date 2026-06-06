@@ -8,6 +8,8 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.TlsClient.Http1;
+using TqkLibrary.TlsClient.Http2;
+using TqkLibrary.TlsClient.Http2.Models;
 using TqkLibrary.TlsClient.Native;
 using TqkLibrary.TlsClient.Native.Models;
 
@@ -33,8 +35,11 @@ namespace TqkLibrary.TlsClient
         /// <summary>Captured ClientHello (full TLS record), base64. Highest-priority fingerprint source.</summary>
         public string? RawClientHelloBase64 { get; set; }
 
-        /// <summary>ALPN protocols to offer. Phase 2 supports only http/1.1.</summary>
-        public IReadOnlyList<string> AlpnProtocols { get; set; } = new[] { "http/1.1" };
+        /// <summary>ALPN protocols to offer (default Chrome-like h2 then http/1.1).</summary>
+        public IReadOnlyList<string> AlpnProtocols { get; set; } = new[] { "h2", "http/1.1" };
+
+        /// <summary>HTTP/2 fingerprint used when h2 is negotiated (SETTINGS/WINDOW_UPDATE/priorities/pseudo-order).</summary>
+        public Http2FingerprintConfig Http2Fingerprint { get; set; } = Http2FingerprintConfig.Chrome();
 
         /// <summary>Skip server certificate validation. Note: the native verifier does not do AIA chasing.</summary>
         public bool InsecureSkipVerify { get; set; }
@@ -73,16 +78,18 @@ namespace TqkLibrary.TlsClient
                 throw;
             }
 
-            if (string.Equals(tls.NegotiatedAlpn, "h2", StringComparison.Ordinal))
-            {
-                tls.Dispose();
-                throw new NotSupportedException("Server negotiated HTTP/2, which is not implemented yet (Phase 3). Restrict AlpnProtocols to http/1.1.");
-            }
-
             try
             {
-                var connection = new Http1Connection(tls, owner: tls);
-                return await connection.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                if (string.Equals(tls.NegotiatedAlpn, "h2", StringComparison.Ordinal))
+                {
+                    var http2 = new Http2Connection(tls, Http2Fingerprint);
+                    HttpResponseMessage response = await http2.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                    tls.Dispose(); // the h2 body is fully buffered into the response, so the connection can close
+                    return response;
+                }
+
+                // HTTP/1.1: the response body streams from tls, so the content owns the connection's lifetime.
+                return await new Http1Connection(tls, owner: tls).SendAsync(request, cancellationToken).ConfigureAwait(false);
             }
             catch
             {
