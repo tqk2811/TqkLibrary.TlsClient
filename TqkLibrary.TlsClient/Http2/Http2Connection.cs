@@ -91,6 +91,7 @@ namespace TqkLibrary.TlsClient.Http2
                 ? await request.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false)
                 : null;
             bool hasBody = body is { Length: > 0 };
+            bool sentPreface = !_started;
 
             using (var outBuf = new MemoryStream())
             {
@@ -111,7 +112,7 @@ namespace TqkLibrary.TlsClient.Http2
                     _activeStreamId, headerBlock);
 
                 byte[] toSend = outBuf.ToArray();
-                Trace?.Invoke("send " + Convert.ToHexString(toSend));
+                Trace?.Invoke($"send {toSend.Length}B preface={sentPreface} stream={_activeStreamId}");
                 await _stream.WriteAsync(toSend, 0, toSend.Length, cancellationToken).ConfigureAwait(false);
                 await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
