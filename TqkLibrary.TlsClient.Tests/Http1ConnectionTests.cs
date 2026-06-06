@@ -34,7 +34,7 @@ namespace TqkLibrary.TlsClient.Tests
             string written = Encoding.ASCII.GetString(dup.Written.ToArray());
             Assert.StartsWith("GET /path?q=1 HTTP/1.1\r\n", written);
             Assert.Contains("Host: example.com\r\n", written);
-            Assert.Contains("Connection: close\r\n", written);
+            Assert.DoesNotContain("Connection: close", written);
         }
 
         [Fact]
@@ -56,6 +56,27 @@ namespace TqkLibrary.TlsClient.Tests
             Assert.Contains("Content-Type: application/json; charset=utf-8\r\n", written);
             Assert.Contains("Content-Length: 7\r\n", written);
             Assert.EndsWith("\r\n\r\n{\"a\":1}", written);
+        }
+
+        [Fact]
+        public async Task PreservesHeaderOrder_AndRawStructuredValues_AndNoConnectionClose()
+        {
+            const string raw = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            var dup = new DuplexTestStream(Encoding.ASCII.GetBytes(raw));
+            var conn = new Http1Connection(dup, new FlagDisposable());
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://example.com/");
+            req.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0 (X) Chrome/124");
+            req.Headers.TryAddWithoutValidation("Accept", "*/*");
+            req.Headers.TryAddWithoutValidation("Accept-Language", "en-US,en;q=0.9");
+
+            using var resp = await conn.SendAsync(req, CancellationToken.None);
+            string written = Encoding.ASCII.GetString(dup.Written.ToArray());
+
+            Assert.Contains("User-Agent: Mozilla/5.0 (X) Chrome/124\r\n", written); // one line, not split into product tokens
+            Assert.Contains("Accept-Language: en-US,en;q=0.9\r\n", written);          // one line, not split
+            Assert.DoesNotContain("Connection: close", written);
+            Assert.True(written.IndexOf("User-Agent:", StringComparison.Ordinal) < written.IndexOf("Accept:", StringComparison.Ordinal));
+            Assert.True(written.IndexOf("Accept:", StringComparison.Ordinal) < written.IndexOf("Accept-Language:", StringComparison.Ordinal));
         }
 
         [Fact]

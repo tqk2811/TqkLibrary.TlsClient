@@ -49,16 +49,18 @@ namespace TqkLibrary.TlsClient.Http1
             if (request.Content != null)
                 body = await request.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
 
-            foreach (var header in request.Headers)
+            // NonValidated preserves the caller's header order and the raw single value (no structured
+            // re-parsing/splitting of User-Agent, Accept-Language, ...). The caller controls h1 header order.
+            foreach (var header in request.Headers.NonValidated)
             {
-                if (IsHost(header.Key) || IsConnection(header.Key)) continue;
+                if (IsHost(header.Key)) continue;
                 foreach (var value in header.Value)
                     sb.Append(header.Key).Append(": ").Append(value).Append("\r\n");
             }
 
             if (request.Content != null)
             {
-                foreach (var header in request.Content.Headers)
+                foreach (var header in request.Content.Headers.NonValidated)
                 {
                     if (string.Equals(header.Key, "Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
                     foreach (var value in header.Value)
@@ -67,8 +69,7 @@ namespace TqkLibrary.TlsClient.Http1
                 sb.Append("Content-Length: ").Append(body!.Length).Append("\r\n");
             }
 
-            // No connection pooling yet: ask the server to close so until-close framing terminates.
-            sb.Append("Connection: close\r\n\r\n");
+            sb.Append("\r\n"); // no forced "Connection: close" (keeps the header set browser-like)
 
             byte[] head = Encoding.ASCII.GetBytes(sb.ToString());
             await _stream.WriteAsync(head, 0, head.Length, ct).ConfigureAwait(false);
@@ -160,7 +161,6 @@ namespace TqkLibrary.TlsClient.Http1
         }
 
         private static bool IsHost(string name) => string.Equals(name, "Host", StringComparison.OrdinalIgnoreCase);
-        private static bool IsConnection(string name) => string.Equals(name, "Connection", StringComparison.OrdinalIgnoreCase);
 
         private static string HostHeaderValue(Uri uri, HttpRequestMessage request)
         {
