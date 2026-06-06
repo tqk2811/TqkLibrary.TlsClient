@@ -53,8 +53,12 @@ The native `tqktls` codec is built with Go + [zig](https://ziglang.org) (used as
 
 ## Notes
 
-- Ships `win-x64` native today; other RIDs build with the same Go/zig toolchain (cross-compile).
-- The native (Go) certificate verifier does not chase missing AIA intermediates; set
-  `InsecureSkipVerify` or ensure servers send complete chains.
+- Native RIDs `win-x64`, `linux-x64`, `linux-arm64` cross-compile from any host with Go + zig
+  (`native\build.ps1 -Rids win-x64,linux-x64,linux-arm64`). `osx-x64`/`osx-arm64` must be built on a
+  Mac (they link Apple frameworks that zig can't supply on its own).
+- Certificates are validated on the .NET side (AIA-aware `X509Chain` + hostname check); use
+  `InsecureSkipVerify` or `ServerCertificateValidationCallback` to customize.
+- Connection reuse (HTTP/2), transparent gzip/deflate/br decompression, flow control and request
+  cancellation are built in. Plug a proxy with `TqkLibrary.TlsClient.Proxy` (`handler.UseProxySource(...)`).
 
 MIT licensed.

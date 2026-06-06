@@ -21,6 +21,8 @@
 		<file src="bin\Release\**\TqkLibrary.TlsClient.xml" target="lib\" />
 
 		<file src="runtimes\win-x64\native\tqktls.dll" target="runtimes\win-x64\native\" />
+		<file src="runtimes\linux-x64\native\libtqktls.so" target="runtimes\linux-x64\native\" />
+		<file src="runtimes\linux-arm64\native\libtqktls.so" target="runtimes\linux-arm64\native\" />
 
 		<file src="TqkLibrary.TlsClient.targets" target="build\" />
 

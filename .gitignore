@@ -367,3 +367,4 @@ FodyWeavers.xsd
 /native/tqktls.lib
 /native/tqktls.exp
 **/runtimes/**/native/tqktls.*
+**/runtimes/**/native/libtqktls.*
