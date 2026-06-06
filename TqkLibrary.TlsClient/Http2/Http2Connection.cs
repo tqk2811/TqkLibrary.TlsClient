@@ -16,7 +16,7 @@ namespace TqkLibrary.TlsClient.Http2
     /// A single-request HTTP/2 client over a plaintext stream (e.g. an authenticated ImpersonatedTlsStream).
     /// It emits the connection preface, SETTINGS, connection WINDOW_UPDATE, PRIORITY frames and the request
     /// HEADERS exactly as described by an <see cref="Http2FingerprintConfig"/> (so the Akamai h2 fingerprint
-    /// matches the configured browser), then decodes the response (HPACK) into an <see cref="HttpResponseMessage"/>.
+    /// matches the configured browser), honors flow control in both directions, then decodes the response.
     ///
     /// One request per connection (no multiplexing/pooling yet); the response body is buffered.
     /// </summary>
@@ -24,11 +24,20 @@ namespace TqkLibrary.TlsClient.Http2
     {
         private static readonly byte[] Preface = Encoding.ASCII.GetBytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
         private const int DefaultMaxFrameSize = 16384;
+        private const int StreamId = 1;
 
         private readonly Stream _stream;
         private readonly Http2FingerprintConfig _config;
         private readonly HpackDecoder _hpack;
         private readonly byte[] _frameHeader = new byte[9];
+
+        // Send-side flow control (how much the server lets us send).
+        private long _connSendWindow = 65535;
+        private long _streamSendWindow = 65535;
+        private int _serverInitialWindow = 65535;
+
+        // Frames read while sending the request body (full-duplex) are stashed for the response reader.
+        private readonly Queue<Frame> _stash = new();
 
         public Http2Connection(Stream stream, Http2FingerprintConfig config)
         {
@@ -45,37 +54,210 @@ namespace TqkLibrary.TlsClient.Http2
         /// <summary>Optional diagnostic sink for sent/received frames (debugging).</summary>
         public Action<string>? Trace { get; set; }
 
+        private readonly struct Frame
+        {
+            public Frame(int length, byte type, byte flags, int streamId, byte[] payload)
+            {
+                Length = length; Type = type; Flags = flags; StreamId = streamId; Payload = payload;
+            }
+            public int Length { get; }
+            public byte Type { get; }
+            public byte Flags { get; }
+            public int StreamId { get; }
+            public byte[] Payload { get; }
+        }
+
         public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            const int streamId = 1;
-
             byte[]? body = request.Content != null
                 ? await request.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false)
                 : null;
             bool hasBody = body is { Length: > 0 };
 
-            using var outBuf = new MemoryStream();
-            outBuf.Write(Preface, 0, Preface.Length);
-            WriteSettingsFrame(outBuf);
-            if (_config.ConnectionWindowUpdateIncrement > 0)
-                WriteFrame(outBuf, Http2FrameType.WindowUpdate, 0, 0, BeUInt32(_config.ConnectionWindowUpdateIncrement));
-            foreach (var p in _config.Priorities)
-                WritePriorityFrame(outBuf, p);
+            using (var outBuf = new MemoryStream())
+            {
+                outBuf.Write(Preface, 0, Preface.Length);
+                WriteSettingsFrame(outBuf);
+                if (_config.ConnectionWindowUpdateIncrement > 0)
+                    WriteFrame(outBuf, Http2FrameType.WindowUpdate, 0, 0, BeUInt32(_config.ConnectionWindowUpdateIncrement));
+                foreach (var p in _config.Priorities)
+                    WritePriorityFrame(outBuf, p);
 
-            byte[] headerBlock = BuildHeaderBlock(request);
-            WriteFrame(outBuf, Http2FrameType.Headers,
-                (byte)(Http2FrameFlags.EndHeaders | (hasBody ? 0 : Http2FrameFlags.EndStream)),
-                streamId, headerBlock);
+                byte[] headerBlock = BuildHeaderBlock(request);
+                WriteFrame(outBuf, Http2FrameType.Headers,
+                    (byte)(Http2FrameFlags.EndHeaders | (hasBody ? 0 : Http2FrameFlags.EndStream)),
+                    StreamId, headerBlock);
+
+                byte[] toSend = outBuf.ToArray();
+                Trace?.Invoke("send " + Convert.ToHexString(toSend));
+                await _stream.WriteAsync(toSend, 0, toSend.Length, cancellationToken).ConfigureAwait(false);
+                await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
 
             if (hasBody)
-                WriteDataFrames(outBuf, streamId, body!);
+                await SendBodyAsync(body!, cancellationToken).ConfigureAwait(false);
 
-            byte[] toSend = outBuf.ToArray();
-            Trace?.Invoke("send " + Convert.ToHexString(toSend));
-            await _stream.WriteAsync(toSend, 0, toSend.Length, cancellationToken).ConfigureAwait(false);
-            await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            return await ReadResponseAsync(request, cancellationToken).ConfigureAwait(false);
+        }
 
-            return await ReadResponseAsync(streamId, request, cancellationToken).ConfigureAwait(false);
+        private async Task SendBodyAsync(byte[] body, CancellationToken ct)
+        {
+            int offset = 0;
+            while (offset < body.Length)
+            {
+                // Wait until both the stream and connection send windows have room.
+                while (_streamSendWindow <= 0 || _connSendWindow <= 0)
+                {
+                    Frame f = await NextFrameAsync(ct).ConfigureAwait(false);
+                    if (!await TryHandleControlFrameAsync(f, ct).ConfigureAwait(false))
+                        _stash.Enqueue(f); // response frame arrived early (full-duplex) — replay it later
+                }
+
+                int allowed = (int)Math.Min(Math.Min(_streamSendWindow, _connSendWindow), DefaultMaxFrameSize);
+                int chunk = Math.Min(allowed, body.Length - offset);
+                bool last = offset + chunk >= body.Length;
+                await WriteRawFrameAsync(Http2FrameType.Data,
+                    (byte)(last ? Http2FrameFlags.EndStream : Http2FrameFlags.None), StreamId, body, offset, chunk, ct).ConfigureAwait(false);
+                offset += chunk;
+                _streamSendWindow -= chunk;
+                _connSendWindow -= chunk;
+            }
+        }
+
+        private async Task<HttpResponseMessage> ReadResponseAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            using var body = new MemoryStream();
+            using var headerBlock = new MemoryStream();
+            List<KeyValuePair<string, string>>? responseHeaders = null;
+            bool endStream = false;
+            bool expectingContinuation = false;
+
+            while (!endStream)
+            {
+                Frame f = await NextFrameAsync(ct).ConfigureAwait(false);
+                var frameType = (Http2FrameType)f.Type;
+
+                if (Trace != null) Trace($"recv type={frameType} flags=0x{f.Flags:x2} sid={f.StreamId} len={f.Length}");
+
+                if (expectingContinuation && !(frameType == Http2FrameType.Continuation && f.StreamId == StreamId))
+                    throw new IOException("Expected CONTINUATION frame.");
+
+                if (await TryHandleControlFrameAsync(f, ct).ConfigureAwait(false))
+                    continue;
+
+                switch (frameType)
+                {
+                    case Http2FrameType.GoAway:
+                        if (responseHeaders is null) throw new IOException("Server sent GOAWAY before responding.");
+                        endStream = true;
+                        break;
+
+                    case Http2FrameType.RstStream:
+                        if (f.StreamId == StreamId)
+                        {
+                            if (responseHeaders is null) throw new IOException("Server reset the stream before responding.");
+                            endStream = true;
+                        }
+                        break;
+
+                    case Http2FrameType.Headers:
+                        if (f.StreamId == StreamId)
+                        {
+                            if (responseHeaders is null)
+                            {
+                                byte[] fragment = ExtractHeaderBlockFragment(f.Payload, f.Flags);
+                                headerBlock.Write(fragment, 0, fragment.Length);
+                            }
+                            bool endHeaders = (f.Flags & (byte)Http2FrameFlags.EndHeaders) != 0;
+                            expectingContinuation = !endHeaders;
+                            if (responseHeaders is null && endHeaders)
+                            {
+                                responseHeaders = _hpack.Decode(headerBlock.ToArray());
+                                headerBlock.SetLength(0);
+                            }
+                            if ((f.Flags & (byte)Http2FrameFlags.EndStream) != 0) endStream = true;
+                        }
+                        break;
+
+                    case Http2FrameType.Continuation:
+                        if (f.StreamId == StreamId)
+                        {
+                            if (responseHeaders is null) headerBlock.Write(f.Payload, 0, f.Payload.Length);
+                            bool endHeaders = (f.Flags & (byte)Http2FrameFlags.EndHeaders) != 0;
+                            expectingContinuation = !endHeaders;
+                            if (responseHeaders is null && endHeaders)
+                            {
+                                responseHeaders = _hpack.Decode(headerBlock.ToArray());
+                                headerBlock.SetLength(0);
+                            }
+                        }
+                        break;
+
+                    case Http2FrameType.Data:
+                        if (f.StreamId == StreamId)
+                        {
+                            WriteData(body, f.Payload, f.Flags);
+                            bool dataEnd = (f.Flags & (byte)Http2FrameFlags.EndStream) != 0;
+                            // Replenish the flow-control windows this DATA frame consumed (full payload length).
+                            if (f.Length > 0)
+                            {
+                                await WriteRawFrameAsync(Http2FrameType.WindowUpdate, 0, 0, BeUInt32((uint)f.Length), ct).ConfigureAwait(false);
+                                if (!dataEnd)
+                                    await WriteRawFrameAsync(Http2FrameType.WindowUpdate, 0, StreamId, BeUInt32((uint)f.Length), ct).ConfigureAwait(false);
+                            }
+                            if (dataEnd) endStream = true;
+                        }
+                        break;
+                }
+            }
+
+            return BuildResponse(responseHeaders!, body.ToArray(), request);
+        }
+
+        // Handles SETTINGS / PING / WINDOW_UPDATE (which both the send and receive paths must process).
+        // Returns true if the frame was a control frame and has been handled.
+        private async Task<bool> TryHandleControlFrameAsync(Frame f, CancellationToken ct)
+        {
+            switch ((Http2FrameType)f.Type)
+            {
+                case Http2FrameType.Settings:
+                    if ((f.Flags & (byte)Http2FrameFlags.Ack) == 0)
+                    {
+                        ApplyServerSettings(f.Payload);
+                        await WriteRawFrameAsync(Http2FrameType.Settings, (byte)Http2FrameFlags.Ack, 0, Array.Empty<byte>(), 0, 0, ct).ConfigureAwait(false);
+                    }
+                    return true;
+
+                case Http2FrameType.Ping:
+                    if ((f.Flags & (byte)Http2FrameFlags.Ack) == 0)
+                        await WriteRawFrameAsync(Http2FrameType.Ping, (byte)Http2FrameFlags.Ack, 0, f.Payload, 0, f.Payload.Length, ct).ConfigureAwait(false);
+                    return true;
+
+                case Http2FrameType.WindowUpdate:
+                    if (f.Payload.Length >= 4)
+                    {
+                        long inc = BeUInt32At(f.Payload, 0) & 0x7fffffff;
+                        if (f.StreamId == 0) _connSendWindow += inc;
+                        else if (f.StreamId == StreamId) _streamSendWindow += inc;
+                    }
+                    return true;
+            }
+            return false;
+        }
+
+        private void ApplyServerSettings(byte[] payload)
+        {
+            for (int i = 0; i + 6 <= payload.Length; i += 6)
+            {
+                ushort id = (ushort)((payload[i] << 8) | payload[i + 1]);
+                uint value = BeUInt32At(payload, i + 2);
+                if (id == (ushort)Http2SettingId.InitialWindowSize)
+                {
+                    // Adjusting SETTINGS_INITIAL_WINDOW_SIZE retroactively shifts open streams' send windows.
+                    _streamSendWindow += (long)value - _serverInitialWindow;
+                    _serverInitialWindow = (int)value;
+                }
+            }
         }
 
         private byte[] BuildHeaderBlock(HttpRequestMessage request)
@@ -123,96 +305,6 @@ namespace TqkLibrary.TlsClient.Http2
             "connection" or "keep-alive" or "proxy-connection" or "transfer-encoding" or "upgrade" => true,
             _ => false,
         };
-
-        private async Task<HttpResponseMessage> ReadResponseAsync(int streamId, HttpRequestMessage request, CancellationToken ct)
-        {
-            using var body = new MemoryStream();
-            using var headerBlock = new MemoryStream();
-            List<KeyValuePair<string, string>>? responseHeaders = null;
-            bool endStream = false;
-            bool expectingContinuation = false;
-
-            while (!endStream)
-            {
-                (int length, byte type, byte flags, int sid) = await ReadFrameHeaderAsync(ct).ConfigureAwait(false);
-                byte[] payload = length > 0 ? await ReadExactlyAsync(length, ct).ConfigureAwait(false) : Array.Empty<byte>();
-                var frameType = (Http2FrameType)type;
-
-                if (Trace != null) Trace($"recv type={frameType} flags=0x{flags:x2} sid={sid} len={length}");
-
-                if (expectingContinuation && !(frameType == Http2FrameType.Continuation && sid == streamId))
-                    throw new IOException("Expected CONTINUATION frame.");
-
-                switch (frameType)
-                {
-                    case Http2FrameType.Settings:
-                        if ((flags & (byte)Http2FrameFlags.Ack) == 0)
-                            await WriteRawFrameAsync(Http2FrameType.Settings, (byte)Http2FrameFlags.Ack, 0, Array.Empty<byte>(), ct).ConfigureAwait(false);
-                        break;
-
-                    case Http2FrameType.Ping:
-                        if ((flags & (byte)Http2FrameFlags.Ack) == 0)
-                            await WriteRawFrameAsync(Http2FrameType.Ping, (byte)Http2FrameFlags.Ack, 0, payload, ct).ConfigureAwait(false);
-                        break;
-
-                    case Http2FrameType.GoAway:
-                        if (responseHeaders is null) throw new IOException("Server sent GOAWAY before responding.");
-                        endStream = true;
-                        break;
-
-                    case Http2FrameType.RstStream:
-                        if (sid == streamId)
-                        {
-                            if (responseHeaders is null) throw new IOException("Server reset the stream before responding.");
-                            endStream = true;
-                        }
-                        break;
-
-                    case Http2FrameType.Headers:
-                        if (sid == streamId)
-                        {
-                            if (responseHeaders is null)
-                            {
-                                byte[] fragment = ExtractHeaderBlockFragment(payload, flags);
-                                headerBlock.Write(fragment, 0, fragment.Length);
-                            }
-                            bool endHeaders = (flags & (byte)Http2FrameFlags.EndHeaders) != 0;
-                            expectingContinuation = !endHeaders;
-                            if (responseHeaders is null && endHeaders)
-                            {
-                                responseHeaders = _hpack.Decode(headerBlock.ToArray());
-                                headerBlock.SetLength(0);
-                            }
-                            if ((flags & (byte)Http2FrameFlags.EndStream) != 0) endStream = true;
-                        }
-                        break;
-
-                    case Http2FrameType.Continuation:
-                        if (sid == streamId)
-                        {
-                            if (responseHeaders is null) headerBlock.Write(payload, 0, payload.Length);
-                            bool endHeaders = (flags & (byte)Http2FrameFlags.EndHeaders) != 0;
-                            expectingContinuation = !endHeaders;
-                            if (responseHeaders is null && endHeaders)
-                            {
-                                responseHeaders = _hpack.Decode(headerBlock.ToArray());
-                                headerBlock.SetLength(0);
-                            }
-                        }
-                        break;
-
-                    case Http2FrameType.Data:
-                        if (sid == streamId)
-                        {
-                            WriteData(body, payload, flags);
-                            if ((flags & (byte)Http2FrameFlags.EndStream) != 0) endStream = true;
-                        }
-                        break;
-                }
-            }
-
-            return BuildResponse(responseHeaders!, body.ToArray(), request);
-        }
 
         private static HttpResponseMessage BuildResponse(List<KeyValuePair<string, string>> headers, byte[] body, HttpRequestMessage request)
         {
@@ -262,7 +354,7 @@ namespace TqkLibrary.TlsClient.Http2
             if (end > start) body.Write(payload, start, end - start);
         }
 
-        // ---- frame writing (into a buffer) ----
+        // ---- frame writing ----
 
         private void WriteSettingsFrame(Stream s)
         {
@@ -293,19 +385,6 @@ namespace TqkLibrary.TlsClient.Http2
             WriteFrame(s, Http2FrameType.Priority, 0, p.StreamId, payload);
         }
 
-        private void WriteDataFrames(Stream s, int streamId, byte[] body)
-        {
-            int offset = 0;
-            while (offset < body.Length)
-            {
-                int chunk = Math.Min(DefaultMaxFrameSize, body.Length - offset);
-                bool last = offset + chunk >= body.Length;
-                WriteFrame(s, Http2FrameType.Data, (byte)(last ? Http2FrameFlags.EndStream : Http2FrameFlags.None),
-                    streamId, body, offset, chunk);
-                offset += chunk;
-            }
-        }
-
         private static void WriteFrame(Stream s, Http2FrameType type, byte flags, int streamId, byte[] payload)
             => WriteFrame(s, type, flags, streamId, payload, 0, payload.Length);
 
@@ -323,34 +402,38 @@ namespace TqkLibrary.TlsClient.Http2
             if (length > 0) s.Write(payload, offset, length);
         }
 
-        private async Task WriteRawFrameAsync(Http2FrameType type, byte flags, int streamId, byte[] payload, CancellationToken ct)
+        private async Task WriteRawFrameAsync(Http2FrameType type, byte flags, int streamId, byte[] payload, int offset, int length, CancellationToken ct)
         {
-            byte[] frame = new byte[9 + payload.Length];
-            int len = payload.Length;
-            frame[0] = (byte)(len >> 16);
-            frame[1] = (byte)(len >> 8);
-            frame[2] = (byte)len;
+            byte[] frame = new byte[9 + length];
+            frame[0] = (byte)(length >> 16);
+            frame[1] = (byte)(length >> 8);
+            frame[2] = (byte)length;
             frame[3] = (byte)type;
             frame[4] = flags;
             frame[5] = (byte)((streamId >> 24) & 0x7f);
             frame[6] = (byte)(streamId >> 16);
             frame[7] = (byte)(streamId >> 8);
             frame[8] = (byte)streamId;
-            if (len > 0) Buffer.BlockCopy(payload, 0, frame, 9, len);
+            if (length > 0) Buffer.BlockCopy(payload, offset, frame, 9, length);
             await _stream.WriteAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
             await _stream.FlushAsync(ct).ConfigureAwait(false);
         }
 
+        private Task WriteRawFrameAsync(Http2FrameType type, byte flags, int streamId, byte[] payload, CancellationToken ct)
+            => WriteRawFrameAsync(type, flags, streamId, payload, 0, payload.Length, ct);
+
         // ---- frame reading ----
 
-        private async Task<(int length, byte type, byte flags, int streamId)> ReadFrameHeaderAsync(CancellationToken ct)
+        private async Task<Frame> NextFrameAsync(CancellationToken ct)
         {
+            if (_stash.Count > 0) return _stash.Dequeue();
             await ReadExactIntoAsync(_frameHeader, 9, ct).ConfigureAwait(false);
             int length = (_frameHeader[0] << 16) | (_frameHeader[1] << 8) | _frameHeader[2];
             byte type = _frameHeader[3];
             byte flags = _frameHeader[4];
             int streamId = ((_frameHeader[5] & 0x7f) << 24) | (_frameHeader[6] << 16) | (_frameHeader[7] << 8) | _frameHeader[8];
-            return (length, type, flags, streamId);
+            byte[] payload = length > 0 ? await ReadExactlyAsync(length, ct).ConfigureAwait(false) : Array.Empty<byte>();
+            return new Frame(length, type, flags, streamId, payload);
         }
 
         private async Task<byte[]> ReadExactlyAsync(int count, CancellationToken ct)
@@ -375,5 +458,8 @@ namespace TqkLibrary.TlsClient.Http2
         {
             (byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value,
         };
+
+        private static uint BeUInt32At(byte[] b, int o)
+            => ((uint)b[o] << 24) | ((uint)b[o + 1] << 16) | ((uint)b[o + 2] << 8) | b[o + 3];
     }
 }
