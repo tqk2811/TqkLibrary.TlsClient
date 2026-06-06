@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Consumer-side: copy the native uTLS codec next to the app output so DllImport("tqktls") resolves
+       on all target frameworks (net6+ also resolves it from runtimes/win-x64/native automatically). -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\tqktls.dll">
+      <Link>tqktls.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>False</Visible>
+      <Pack>false</Pack>
+    </None>
+  </ItemGroup>
+</Project>

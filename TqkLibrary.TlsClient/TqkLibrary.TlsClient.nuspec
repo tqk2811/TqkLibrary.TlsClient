@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+	<metadata>
+		<id>$id$</id>
+		<version>$version$</version>
+		<authors>tqk2811</authors>
+		<description>HttpClient that impersonates a browser's TLS (JA3/JA4) and HTTP/2 (Akamai) fingerprint, backed by a native uTLS codec. Supports captured-ClientHello profiles, named presets (chrome/firefox/safari), and a Chrome HTTP/2 fingerprint. Plug your own transport/proxy by returning a Stream.</description>
+		<projectUrl>https://github.com/tqk2811/TqkLibrary.TlsClient</projectUrl>
+		<repository type="git" url="https://github.com/tqk2811/TqkLibrary.TlsClient.git"/>
+		<license type="expression">MIT</license>
+		<readme>docs\README.md</readme>
+		<tags>tls ja3 ja4 akamai http2 fingerprint impersonate httpclient utls chrome</tags>
+		<dependencies>
+			<group targetFramework="net6.0">
+			</group>
+		</dependencies>
+	</metadata>
+	<files>
+		<file src="bin\Release\**\TqkLibrary.TlsClient.dll" target="lib\" />
+		<file src="bin\Release\**\TqkLibrary.TlsClient.pdb" target="lib\" />
+		<file src="bin\Release\**\TqkLibrary.TlsClient.xml" target="lib\" />
+
+		<file src="runtimes\win-x64\native\tqktls.dll" target="runtimes\win-x64\native\" />
+
+		<file src="TqkLibrary.TlsClient.targets" target="build\" />
+
+		<file src="..\README.md" target="docs\" />
+	</files>
+</package>
