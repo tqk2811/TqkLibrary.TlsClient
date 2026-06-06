@@ -7,6 +7,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="TqkLibrary.TlsClient.Tests" />
+  </ItemGroup>
+
   <!-- Native uTLS codec. Built by native\build.ps1 into runtimes\<rid>\native.
        Linked to the output root so DllImport("tqktls") resolves during local runs. -->
   <ItemGroup>
