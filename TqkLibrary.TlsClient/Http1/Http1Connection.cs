@@ -12,15 +12,17 @@ namespace TqkLibrary.TlsClient.Http1
     /// <summary>
     /// Minimal HTTP/1.1 exchange over a (plaintext) stream: writes the request with caller-controlled
     /// header order, then parses the response status line/headers and exposes the body via
-    /// <see cref="Http1ContentStream"/>. One request per connection (no pooling yet).
+    /// <see cref="Http1ContentStream"/>. The connection is reusable (keep-alive): after the body is fully
+    /// drained, <see cref="OnResponseDrained"/> fires so a pool can take it back for the next request.
     /// </summary>
     internal sealed class Http1Connection
     {
         private readonly Stream _stream;
         private readonly IDisposable _owner;
-        private readonly byte[] _buf = new byte[8192];
+        private byte[] _buf = new byte[8192];
         private int _pos;
         private int _len;
+        private byte[]? _seed; // bytes over-read past the previous response (start of this one), consumed first
 
         /// <param name="stream">Plaintext stream (e.g. an authenticated <c>ImpersonatedTlsStream</c>).</param>
         /// <param name="owner">Disposed when the response body is disposed (the TLS connection + transport).</param>
@@ -30,8 +32,16 @@ namespace TqkLibrary.TlsClient.Http1
             _owner = owner;
         }
 
+        /// <summary>
+        /// Invoked when the response body is disposed, with whether the connection is reusable (keep-alive AND
+        /// the body was fully drained). When null, the connection's owner is disposed instead.
+        /// </summary>
+        public Action<bool>? OnResponseDrained { get; set; }
+
         public async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
+            _pos = 0;
+            _len = 0; // reset the read buffer for a reused (keep-alive) connection
             await WriteRequestAsync(request, ct).ConfigureAwait(false);
             return await ReadResponseAsync(request, ct).ConfigureAwait(false);
         }
@@ -86,6 +96,7 @@ namespace TqkLibrary.TlsClient.Http1
 
             var headers = new List<KeyValuePair<string, string>>();
             bool chunked = false;
+            bool responseClose = false;
             long? contentLength = null;
 
             while (true)
@@ -102,14 +113,35 @@ namespace TqkLibrary.TlsClient.Http1
                 else if (string.Equals(name, "Transfer-Encoding", StringComparison.OrdinalIgnoreCase) &&
                          value.IndexOf("chunked", StringComparison.OrdinalIgnoreCase) >= 0)
                     chunked = true;
+                else if (string.Equals(name, "Connection", StringComparison.OrdinalIgnoreCase) &&
+                         value.IndexOf("close", StringComparison.OrdinalIgnoreCase) >= 0)
+                    responseClose = true;
 
                 headers.Add(new KeyValuePair<string, string>(name, value));
             }
 
+            // Responses that by definition carry no body have a determinate (zero-length) end.
+            int statusCode = (int)response.StatusCode;
+            bool noBodyStatus = statusCode == 204 || statusCode == 304 || (statusCode >= 100 && statusCode < 200);
+            if (noBodyStatus && !chunked && !contentLength.HasValue) contentLength = 0;
+
+            // Keep-alive on HTTP/1.1 unless either side asked to close and the body has a determinate end
+            // (a read-until-close body forces the connection closed, so it can't be reused).
+            bool determinateEnd = chunked || contentLength.HasValue;
+            bool keepAlive = response.Version == HttpVersion.Version11 && !responseClose && !RequestWantsClose(request) && determinateEnd;
+
             byte[] prefix = new byte[_len - _pos];
             Array.Copy(_buf, _pos, prefix, 0, prefix.Length);
 
-            var bodyStream = new Http1ContentStream(prefix, _stream, chunked, contentLength, _owner);
+            Http1ContentStream bodyStream = null!;
+            Action<bool> onDisposed = reusable =>
+            {
+                // On reuse, hand back any bytes the header read over-read (the next response's start).
+                if (reusable) _seed = bodyStream.TakeUnconsumedPrefix();
+                if (OnResponseDrained != null) OnResponseDrained(reusable);
+                else _owner.Dispose();
+            };
+            bodyStream = new Http1ContentStream(prefix, _stream, chunked, contentLength, _owner, keepAlive, onDisposed);
             var content = new StreamContent(bodyStream);
             response.Content = content;
 
@@ -125,6 +157,7 @@ namespace TqkLibrary.TlsClient.Http1
         private static void ParseStatusLine(string line, HttpResponseMessage response)
         {
             // "HTTP/1.1 200 OK"
+            if (line.StartsWith("HTTP/1.0", StringComparison.Ordinal)) response.Version = HttpVersion.Version10;
             int sp1 = line.IndexOf(' ');
             if (sp1 < 0) throw new IOException("Malformed status line: " + line);
             int sp2 = line.IndexOf(' ', sp1 + 1);
@@ -156,11 +189,29 @@ namespace TqkLibrary.TlsClient.Http1
 
         private async Task FillAsync(CancellationToken ct)
         {
+            if (_seed != null)
+            {
+                _buf = _seed; // adopt the over-read leftover from the previous keep-alive response
+                _pos = 0;
+                _len = _seed.Length;
+                _seed = null;
+                return;
+            }
+            if (_buf.Length < 8192) _buf = new byte[8192]; // we may have adopted a small seed buffer previously
             _pos = 0;
             _len = await _stream.ReadAsync(_buf, 0, _buf.Length, ct).ConfigureAwait(false);
         }
 
         private static bool IsHost(string name) => string.Equals(name, "Host", StringComparison.OrdinalIgnoreCase);
+
+        private static bool RequestWantsClose(HttpRequestMessage request)
+        {
+            if (request.Headers.NonValidated.TryGetValues("Connection", out var values))
+                foreach (var v in values)
+                    if (v.IndexOf("close", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+            return false;
+        }
 
         private static string HostHeaderValue(Uri uri, HttpRequestMessage request)
         {

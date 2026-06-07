@@ -17,6 +17,9 @@ namespace TqkLibrary.TlsClient.Http1
         private int _prefixPos;
         private readonly Stream _inner;
         private readonly IDisposable? _owner;
+        private readonly bool _keepAlive;
+        private readonly Action<bool>? _onDisposed;
+        private bool _disposed;
 
         private readonly bool _chunked;
         private readonly bool _hasLength;
@@ -27,11 +30,24 @@ namespace TqkLibrary.TlsClient.Http1
         private long _chunkRemaining;
         private bool _sawAnyChunk;
 
-        public Http1ContentStream(byte[] prefix, Stream inner, bool chunked, long? contentLength, IDisposable? owner)
+        /// <param name="prefix">Bytes already read past the header block (drained before reading from <paramref name="inner"/>).</param>
+        /// <param name="inner">The underlying (plaintext) stream the body continues from.</param>
+        /// <param name="chunked">Whether the body is Transfer-Encoding: chunked.</param>
+        /// <param name="contentLength">The Content-Length, or null when chunked / read-until-close.</param>
+        /// <param name="owner">Disposed on dispose when <paramref name="onDisposed"/> is null (the TLS connection + transport).</param>
+        /// <param name="keepAlive">Whether the connection could be reused once the body is fully drained.</param>
+        /// <param name="onDisposed">
+        /// When set, invoked on dispose with whether the connection is reusable (keep-alive AND fully drained),
+        /// instead of disposing <paramref name="owner"/> directly. When null, <paramref name="owner"/> is disposed.
+        /// </param>
+        public Http1ContentStream(byte[] prefix, Stream inner, bool chunked, long? contentLength, IDisposable? owner,
+            bool keepAlive = false, Action<bool>? onDisposed = null)
         {
             _prefix = prefix.Length > 0 ? prefix : null;
             _inner = inner;
             _owner = owner;
+            _keepAlive = keepAlive;
+            _onDisposed = onDisposed;
             _chunked = chunked;
             if (chunked)
             {
@@ -162,11 +178,34 @@ namespace TqkLibrary.TlsClient.Http1
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
+        /// <summary>True once the body has been fully consumed (so the connection's read position is at the next response).</summary>
+        private bool Drained => _chunked ? _chunkedDone : (_hasLength ? _remaining <= 0 : false);
+
+        /// <summary>
+        /// Returns and clears any bytes that were buffered past this body (the start of the next pipelined/keep-alive
+        /// response that the header read over-read). The owning connection seeds these for its next request.
+        /// </summary>
+        public byte[] TakeUnconsumedPrefix()
+        {
+            if (_prefix == null || _prefixPos >= _prefix.Length) return Array.Empty<byte>();
+            byte[] rest = _prefix[_prefixPos..];
+            _prefix = null;
+            return rest;
+        }
+
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && !_disposed)
             {
-                try { _owner?.Dispose(); } catch { /* best effort */ }
+                _disposed = true;
+                if (_onDisposed != null)
+                {
+                    try { _onDisposed(_keepAlive && Drained); } catch { /* best effort */ }
+                }
+                else
+                {
+                    try { _owner?.Dispose(); } catch { /* best effort */ }
+                }
             }
             base.Dispose(disposing);
         }
