@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using TqkLibrary.TlsClient.Capture;
 using TqkLibrary.TlsClient.Http2.Models;
 
 namespace TqkLibrary.TlsClient.Profiles
@@ -40,6 +41,22 @@ namespace TqkLibrary.TlsClient.Profiles
         /// <summary>A profile from a full captured ClientHello TLS record (e.g. sniffed by your proxy).</summary>
         public static TlsProfile FromCapturedClientHello(ReadOnlySpan<byte> rawClientHelloRecord)
             => new() { RawClientHelloBase64 = Convert.ToBase64String(rawClientHelloRecord) };
+
+        /// <summary>
+        /// Builds a profile from the raw, pre-encryption client→server bytes captured off the wire (what your
+        /// proxy reads before the TLS session starts). The leading TLS ClientHello record is extracted and its
+        /// advertised ALPN is carried into the profile. Throws when no complete ClientHello is present.
+        /// </summary>
+        public static TlsProfile FromCapturedHandshake(ReadOnlySpan<byte> rawClientBytes)
+        {
+            if (!ClientHelloCapture.TryExtractClientHello(rawClientBytes, out byte[] record))
+                throw new ArgumentException("No complete TLS ClientHello record found at the start of the captured bytes.", nameof(rawClientBytes));
+
+            var profile = FromCapturedClientHello(record);
+            if (ClientHelloCapture.TryExtractAlpn(record, out List<string> alpn))
+                profile.Alpn = alpn;
+            return profile;
+        }
 
         private static readonly JsonSerializerOptions JsonOptions = new()
         {
