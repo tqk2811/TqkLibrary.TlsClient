@@ -8,6 +8,8 @@ An `HttpClient` that impersonates a browser's **TLS (JA3/JA4)** and **HTTP/2 (Ak
 - The fingerprint is **data**: use a named preset, a JA3 string, or a **captured ClientHello**
   (sniff it from your own proxy and replay its shape).
 - Bring your own transport/proxy by returning a `Stream`.
+- HTTP/2 requests are **multiplexed** over one shared connection per host (like a real browser);
+  HTTP/1.1 connections are **kept alive** and pooled.
 
 ## Usage
 
@@ -42,6 +44,25 @@ await tls.AuthenticateAsClientAsync(new TlsCodecOptions
 Compose with your own `DelegatingHandler` pipeline (redirect/cookie handlers) by passing a
 `pipeline` to `CreateHttpClient`, or by wrapping `new TlsImpersonateHandler(profile)` yourself.
 
+### Capture a real browser from your proxy
+
+If your proxy reads the raw TCP stream, turn the **pre-encryption** ClientHello (the cleartext
+client→server bytes) straight into a profile:
+
+```csharp
+using TqkLibrary.TlsClient.Capture;
+using TqkLibrary.TlsClient.Profiles;
+
+// rawClientBytes = the first bytes the real browser sent (before TLS is established)
+TlsProfile profile = TlsProfile.FromCapturedHandshake(rawClientBytes); // extracts the ClientHello + its ALPN
+
+// or sniff it inline while relaying, then read CapturedClientHello:
+var tee = new ClientHelloCaptureStream(clientStream);
+```
+
+Only the TLS handshake is cleartext here. Capture the HTTP/2 (Akamai) fingerprint from the decrypted
+side and load it with `Http2FingerprintConfig.FromAkamai("1:65536,2:0,4:6291456,6:262144|15663105|0|m,a,s,p")`.
+
 ## Building the native library
 
 The native `tqktls` codec is built with Go + [zig](https://ziglang.org) (used as the cgo C compiler):
@@ -58,7 +79,8 @@ The native `tqktls` codec is built with Go + [zig](https://ziglang.org) (used as
   Mac (they link Apple frameworks that zig can't supply on its own).
 - Certificates are validated on the .NET side (AIA-aware `X509Chain` + hostname check); use
   `InsecureSkipVerify` or `ServerCertificateValidationCallback` to customize.
-- Connection reuse (HTTP/2), transparent gzip/deflate/br decompression, flow control and request
-  cancellation are built in. Plug a proxy with `TqkLibrary.TlsClient.Proxy` (`handler.UseProxySource(...)`).
+- HTTP/2 multiplexing (shared per-host connection), HTTP/1.1 keep-alive pooling, transparent
+  gzip/deflate/br decompression, flow control and request cancellation are built in. Plug a proxy with
+  `TqkLibrary.TlsClient.Proxy` (`handler.UseProxySource(...)`).
 
 MIT licensed.
