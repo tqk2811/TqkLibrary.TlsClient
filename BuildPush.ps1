@@ -1,6 +1,6 @@
 # Builds the native uTLS codec and packs the NuGet package (Release).
-# GitVersion derives the version from the git tag (tag vMAJOR.MINOR.0 to release).
-# Push the resulting .nupkg with your usual tooling (CsharpNugetPush / 'dotnet nuget push').
+# GitVersion derives the version from the git tag (tag vM.N.P; M.N.P on the tagged commit, M.N.P-dev.N after it).
+# Releases are built and pushed by CI (.github/workflows/release.yml) when a tag vM.N.P is pushed.
 $ErrorActionPreference = 'Stop'
 $repo = $PSScriptRoot
 Set-Location $repo

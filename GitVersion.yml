@@ -1,5 +1,5 @@
 deployment-mode: ManualDeployment
-tag-prefix: '[vV]?'
+tag-prefix: 'v'
 branches:
   master:
     regex: ^master$
@@ -7,3 +7,8 @@ branches:
   main:
     regex: ^main$
     increment: None
+  unknown:
+    regex: ^(?!master$|main$).+
+    increment: None
+    source-branches: [master, main]
+    label: dev

@@ -1,0 +1,59 @@
+name: Test
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
+
+      # The native uTLS codec (Go, cgo) is not committed: build it with native/build.ps1.
+      # zig is the cgo C compiler; native/build.ps1 takes the Go root and the zig path as parameters.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build native codec (win-x64)
+        shell: pwsh
+        run: |
+          $zig = (Get-Command zig).Source
+          ./native/build.ps1 -GoRoot (go env GOROOT) -Zig $zig -Rids win-x64
+
+      # The tests target net6.0, so the net6.0 runtime is installed next to the 8.0 SDK.
+      # Tests do not need a real version: skip GitVersion (it fails on branches without a full SemVer tag).
+      # Category=Integration needs the network (a live httpbin), so CI skips it.
+      - name: Test
+        run: >
+          dotnet test TqkLibrary.TlsClient.Tests/TqkLibrary.TlsClient.Tests.csproj -c Release
+          -p:DisableGitVersionTask=true -p:Version=0.0.0
+          --filter "Category!=Integration"
+          --logger "trx;LogFileName=test-results.trx"
+          --logger "console;verbosity=normal"
+          --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: ignore
